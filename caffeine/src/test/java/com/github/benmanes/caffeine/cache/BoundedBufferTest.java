@@ -15,12 +15,10 @@
  */
 package com.github.benmanes.caffeine.cache;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.greaterThan;
-import static org.hamcrest.Matchers.is;
+import static com.google.common.truth.Truth.assertThat;
 
+import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.testng.annotations.DataProvider;
@@ -33,43 +31,44 @@ import com.github.benmanes.caffeine.testing.ConcurrentTestHarness;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@SuppressWarnings("ClassEscapesDefinedScope")
 public final class BoundedBufferTest {
-  static final String DUMMY = "test";
 
   @DataProvider
   public Object[][] buffer() {
-    return new Object[][] {{ new BoundedBuffer<String>() }};
+    return new Object[][] {{ new BoundedBuffer<Boolean>() }};
   }
 
   @Test(dataProvider = "buffer")
-  public void offer(BoundedBuffer<String> buffer) {
+  public void offer(BoundedBuffer<Boolean> buffer) {
     ConcurrentTestHarness.timeTasks(10, () -> {
       for (int i = 0; i < 100; i++) {
-        buffer.offer(DUMMY);
+        assertThat(buffer.offer(Boolean.TRUE)).isAnyOf(Buffer.SUCCESS, Buffer.FULL, Buffer.FAILED);
       }
     });
-    assertThat(buffer.writes(), is(greaterThan(0)));
-    assertThat(buffer.writes(), is(buffer.size()));
+    assertThat(buffer.writes()).isGreaterThan(0);
+    assertThat(buffer.writes()).isEqualTo(buffer.size());
   }
 
   @Test(dataProvider = "buffer")
-  public void drain(BoundedBuffer<String> buffer) {
+  public void drain(BoundedBuffer<Boolean> buffer) {
     for (int i = 0; i < BoundedBuffer.BUFFER_SIZE; i++) {
-      buffer.offer(DUMMY);
+      assertThat(buffer.offer(Boolean.TRUE)).isAnyOf(Buffer.SUCCESS, Buffer.FULL);
     }
-    int[] read = new int[1];
+    long[] read = new long[1];
     buffer.drainTo(e -> read[0]++);
-    assertThat(read[0], is(buffer.reads()));
-    assertThat(read[0], is(buffer.writes()));
+    assertThat(read[0]).isEqualTo(buffer.reads());
+    assertThat(read[0]).isEqualTo(buffer.writes());
   }
 
   @Test(dataProvider = "buffer")
-  public void offerAndDrain(BoundedBuffer<String> buffer) {
-    Lock lock = new ReentrantLock();
-    AtomicInteger reads = new AtomicInteger();
+  @SuppressWarnings("ThreadPriorityCheck")
+  public void offerAndDrain(BoundedBuffer<Boolean> buffer) {
+    var lock = new ReentrantLock();
+    var reads = new AtomicInteger();
     ConcurrentTestHarness.timeTasks(10, () -> {
       for (int i = 0; i < 1000; i++) {
-        boolean shouldDrain = (buffer.offer(DUMMY) == Buffer.FULL);
+        boolean shouldDrain = (buffer.offer(Boolean.TRUE) == Buffer.FULL);
         if (shouldDrain && lock.tryLock()) {
           buffer.drainTo(e -> reads.incrementAndGet());
           lock.unlock();
@@ -78,7 +77,34 @@ public final class BoundedBufferTest {
       }
     });
     buffer.drainTo(e -> reads.incrementAndGet());
-    assertThat(reads.intValue(), is(buffer.reads()));
-    assertThat(reads.intValue(), is(buffer.writes()));
+    assertThat(reads.longValue()).isEqualTo(buffer.reads());
+    assertThat(reads.longValue()).isEqualTo(buffer.writes());
+  }
+
+  @Test
+  public void overflow() {
+    @SuppressWarnings("NullAway")
+    var buffer = new BoundedBuffer.RingBuffer<Boolean>(null);
+    buffer.writeCounter = Long.MAX_VALUE;
+    buffer.readCounter = Long.MAX_VALUE;
+
+    assertThat(buffer.offer(Boolean.TRUE)).isEqualTo(Buffer.SUCCESS);
+    var data = new ArrayList<>();
+    buffer.drainTo(data::add);
+
+    for (var e : buffer.buffer) {
+      assertThat(e).isNull();
+    }
+    assertThat(data).containsExactly(Boolean.TRUE);
+    assertThat(buffer.readCounter).isEqualTo(Long.MIN_VALUE);
+    assertThat(buffer.writeCounter).isEqualTo(Long.MIN_VALUE);
+  }
+
+  @Test
+  @SuppressWarnings("PMD.AvoidAccessibilityAlteration")
+  public void reflectivelyConstruct() throws ReflectiveOperationException {
+    var constructor = BBHeader.class.getDeclaredConstructor();
+    constructor.setAccessible(true);
+    constructor.newInstance();
   }
 }

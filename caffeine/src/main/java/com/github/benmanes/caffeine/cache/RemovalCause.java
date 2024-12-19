@@ -15,11 +15,14 @@
  */
 package com.github.benmanes.caffeine.cache;
 
+import org.jspecify.annotations.NullMarked;
+
 /**
  * The reason why a cached entry was removed.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@NullMarked
 public enum RemovalCause {
 
   /**
@@ -29,6 +32,7 @@ public enum RemovalCause {
    *   <li>{@link Cache#invalidate}</li>
    *   <li>{@link Cache#invalidateAll(Iterable)}</li>
    *   <li>{@link Cache#invalidateAll()}</li>
+   *   <li>{@link LoadingCache#refresh}</li>
    *   <li>{@link java.util.Map#remove}</li>
    *   <li>{@link java.util.Map#computeIfPresent}</li>
    *   <li>{@link java.util.Map#compute}</li>
@@ -57,6 +61,7 @@ public enum RemovalCause {
    * <ul>
    *   <li>{@link Cache#put}</li>
    *   <li>{@link Cache#putAll}</li>
+   *   <li>{@link LoadingCache#getAll}</li>
    *   <li>{@link LoadingCache#refresh}</li>
    *   <li>{@link java.util.Map#put}</li>
    *   <li>{@link java.util.Map#putAll}</li>
@@ -85,7 +90,8 @@ public enum RemovalCause {
 
   /**
    * The entry's expiration timestamp has passed. This can occur when using
-   * {@link Caffeine#expireAfterWrite} or {@link Caffeine#expireAfterAccess}.
+   * {@link Caffeine#expireAfterWrite}, {@link Caffeine#expireAfterAccess},
+   * or {@link Caffeine#expireAfter(Expiry)}.
    */
   EXPIRED {
     @Override public boolean wasEvicted() {

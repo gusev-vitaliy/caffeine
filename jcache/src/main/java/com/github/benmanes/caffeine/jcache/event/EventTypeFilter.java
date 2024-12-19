@@ -28,6 +28,8 @@ import javax.cache.event.CacheEntryListenerException;
 import javax.cache.event.CacheEntryRemovedListener;
 import javax.cache.event.CacheEntryUpdatedListener;
 
+import org.jspecify.annotations.Nullable;
+
 /**
  * A filter that determines if the listener can process the event type before delegating to the
  * decorated filter.
@@ -59,19 +61,18 @@ final class EventTypeFilter<K, V> implements CacheEntryEventFilter<K, V> {
         return (listener instanceof CacheEntryRemovedListener<?, ?>);
       case EXPIRED:
         return (listener instanceof CacheEntryExpiredListener<?, ?>);
-      default:
-        throw new CacheEntryListenerException("Unknown event type: " + event.getEventType());
     }
+    throw new CacheEntryListenerException("Unknown event type: " + event.getEventType());
   }
 
   @Override
-  public boolean equals(Object o) {
+  public boolean equals(@Nullable Object o) {
     if (o == this) {
       return true;
     } else if (!(o instanceof EventTypeFilter<?, ?>)) {
       return false;
     }
-    EventTypeFilter<?, ?> other = (EventTypeFilter<?, ?>) o;
+    var other = (EventTypeFilter<?, ?>) o;
     return Objects.equals(listener, other.listener)
         && Objects.equals(filter, other.filter);
   }

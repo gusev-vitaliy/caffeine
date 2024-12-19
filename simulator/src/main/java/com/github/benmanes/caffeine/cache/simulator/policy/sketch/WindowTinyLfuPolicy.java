@@ -16,15 +16,19 @@
 package com.github.benmanes.caffeine.cache.simulator.policy.sketch;
 
 import static com.google.common.base.Preconditions.checkState;
-import static java.util.stream.Collectors.toSet;
+import static java.util.stream.Collectors.toUnmodifiableSet;
 
 import java.util.List;
 import java.util.Set;
 
+import org.jspecify.annotations.Nullable;
+
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
+import com.github.benmanes.caffeine.cache.simulator.admission.Admission;
 import com.github.benmanes.caffeine.cache.simulator.admission.Admittor;
-import com.github.benmanes.caffeine.cache.simulator.admission.TinyLfu;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
 import com.google.common.base.MoreObjects;
 import com.typesafe.config.Config;
@@ -36,58 +40,57 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  * An adaption of the TinyLfu policy that adds a temporal admission window. This window allows the
  * policy to have a high hit rate when entries exhibit a high temporal / low frequency pattern.
  * <p>
- * A new entry starts in the eden queue and remains there as long as it has high temporal locality.
- * Eventually an entry will slip from the end of the eden queue onto the front of the main queue. If
- * the main queue is already full, then a historic frequency filter determines whether to evict the
+ * A new entry starts in the window and remains there as long as it has high temporal locality.
+ * Eventually an entry will slip from the end of the window onto the front of the main queue. If the
+ * main queue is already full, then a historic frequency filter determines whether to evict the
  * newly admitted entry or the victim entry chosen by main queue's policy. This process ensures that
- * the entries in the main queue have both a high recency and frequency. The eden space uses LRU
+ * the entries in the main queue have both a high recency and frequency. The window space uses LRU
  * and the main uses Segmented LRU.
  * <p>
- * Scan resistance is achieved by means of the eden queue. Transient data will pass through from the
- * eden queue and not be accepted into the main queue. Responsiveness is maintained by the main
- * queue's LRU and the TinyLfu's reset operation so that expired long term entries fade away.
+ * Scan resistance is achieved by means of the window. Transient data will pass through from the
+ * window and not be accepted into the main queue. Responsiveness is maintained by the main queue's
+ * LRU and the TinyLfu's reset operation so that expired long term entries fade away.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class WindowTinyLfuPolicy implements Policy {
+@PolicySpec(name = "sketch.WindowTinyLfu")
+public final class WindowTinyLfuPolicy implements KeyOnlyPolicy {
   private final Long2ObjectMap<Node> data;
   private final PolicyStats policyStats;
-  private final int recencyMoveDistance;
   private final Admittor admittor;
   private final int maximumSize;
 
-  private final Node headEden;
+  private final Node headWindow;
   private final Node headProbation;
   private final Node headProtected;
 
-  private final int maxEden;
+  private final int maxWindow;
   private final int maxProtected;
 
-  private int sizeEden;
+  private int sizeWindow;
   private int sizeProtected;
-  private int mainRecencyCounter;
 
+  @SuppressWarnings("Varifier")
   public WindowTinyLfuPolicy(double percentMain, WindowTinyLfuSettings settings) {
-    String name = String.format("sketch.WindowTinyLfu (%.0f%%)", 100 * (1.0d - percentMain));
-    int maxMain = (int) (settings.maximumSize() * percentMain);
-    this.recencyMoveDistance = (int) (maxMain * settings.percentFastPath());
+    this.policyStats = new PolicyStats(name() + " (%.0f%%)", 100 * (1.0d - percentMain));
+    this.admittor = Admission.TINYLFU.from(settings.config(), policyStats);
+    this.maximumSize = Math.toIntExact(settings.maximumSize());
+
+    int maxMain = (int) (maximumSize * percentMain);
     this.maxProtected = (int) (maxMain * settings.percentMainProtected());
-    this.maxEden = settings.maximumSize() - maxMain;
-    this.admittor = new TinyLfu(settings.config());
     this.data = new Long2ObjectOpenHashMap<>();
-    this.maximumSize = settings.maximumSize();
-    this.policyStats = new PolicyStats(name);
+    this.maxWindow = maximumSize - maxMain;
     this.headProtected = new Node();
     this.headProbation = new Node();
-    this.headEden = new Node();
+    this.headWindow = new Node();
   }
 
   /** Returns all variations of this policy based on the configuration parameters. */
   public static Set<Policy> policies(Config config) {
-    WindowTinyLfuSettings settings = new WindowTinyLfuSettings(config);
+    var settings = new WindowTinyLfuSettings(config);
     return settings.percentMain().stream()
         .map(percentMain -> new WindowTinyLfuPolicy(percentMain, settings))
-        .collect(toSet());
+        .collect(toUnmodifiableSet());
   }
 
   @Override
@@ -102,8 +105,8 @@ public final class WindowTinyLfuPolicy implements Policy {
     if (node == null) {
       onMiss(key);
       policyStats.recordMiss();
-    } else if (node.status == Status.EDEN) {
-      onEdenHit(node);
+    } else if (node.status == Status.WINDOW) {
+      onWindowHit(node);
       policyStats.recordHit();
     } else if (node.status == Status.PROBATION) {
       onProbationHit(node);
@@ -120,17 +123,17 @@ public final class WindowTinyLfuPolicy implements Policy {
   private void onMiss(long key) {
     admittor.record(key);
 
-    Node node = new Node(key, Status.EDEN);
-    node.appendToTail(headEden);
+    var node = new Node(key, Status.WINDOW);
+    node.appendToTail(headWindow);
     data.put(key, node);
-    sizeEden++;
+    sizeWindow++;
     evict();
   }
 
   /** Moves the entry to the MRU position in the admission window. */
-  private void onEdenHit(Node node) {
+  private void onWindowHit(Node node) {
     admittor.record(node.key);
-    node.moveToTail(headEden);
+    node.moveToTail(headWindow);
   }
 
   /** Promotes the entry to the protected region's MRU position, demoting an entry if necessary. */
@@ -140,7 +143,6 @@ public final class WindowTinyLfuPolicy implements Policy {
     node.remove();
     node.status = Status.PROTECTED;
     node.appendToTail(headProtected);
-    node.recencyMove = ++mainRecencyCounter;
 
     sizeProtected++;
     if (sizeProtected > maxProtected) {
@@ -152,14 +154,10 @@ public final class WindowTinyLfuPolicy implements Policy {
     }
   }
 
-  /** Moves the entry to the MRU position, if it falls outside of the fast-path threshold. */
+  /** Moves the entry to the MRU position if it falls outside of the fast-path threshold. */
   private void onProtectedHit(Node node) {
-    // Fast path skips the hottest entries, useful for concurrent caches
-    if (node.recencyMove <= (mainRecencyCounter - recencyMoveDistance)) {
-      admittor.record(node.key);
-      node.moveToTail(headProtected);
-      node.recencyMove = ++mainRecencyCounter;
-    }
+    admittor.record(node.key);
+    node.moveToTail(headProtected);
   }
 
   /**
@@ -167,12 +165,12 @@ public final class WindowTinyLfuPolicy implements Policy {
    * then the admission candidate and probation's victim are evaluated and one is evicted.
    */
   private void evict() {
-    if (sizeEden <= maxEden) {
+    if (sizeWindow <= maxWindow) {
       return;
     }
 
-    Node candidate = headEden.next;
-    sizeEden--;
+    Node candidate = headWindow.next;
+    sizeWindow--;
 
     candidate.remove();
     candidate.status = Status.PROBATION;
@@ -190,29 +188,28 @@ public final class WindowTinyLfuPolicy implements Policy {
 
   @Override
   public void finished() {
-    long edenSize = data.values().stream().filter(n -> n.status == Status.EDEN).count();
+    long windowSize = data.values().stream().filter(n -> n.status == Status.WINDOW).count();
     long probationSize = data.values().stream().filter(n -> n.status == Status.PROBATION).count();
     long protectedSize = data.values().stream().filter(n -> n.status == Status.PROTECTED).count();
 
-    checkState(edenSize == sizeEden);
+    checkState(windowSize == sizeWindow);
     checkState(protectedSize == sizeProtected);
-    checkState(probationSize == data.size() - edenSize - protectedSize);
+    checkState(probationSize == data.size() - windowSize - protectedSize);
 
     checkState(data.size() <= maximumSize);
   }
 
   enum Status {
-    EDEN, PROBATION, PROTECTED
+    WINDOW, PROBATION, PROTECTED
   }
 
   /** A node on the double-linked list. */
   static final class Node {
     final long key;
 
-    int recencyMove;
-    Status status;
-    Node prev;
-    Node next;
+    @Nullable Node prev;
+    @Nullable Node next;
+    @Nullable Status status;
 
     /** Creates a new sentinel node. */
     public Node() {
@@ -253,12 +250,11 @@ public final class WindowTinyLfuPolicy implements Policy {
       return MoreObjects.toStringHelper(this)
           .add("key", key)
           .add("status", status)
-          .add("move", recencyMove)
           .toString();
     }
   }
 
-  static final class WindowTinyLfuSettings extends BasicSettings {
+  public static final class WindowTinyLfuSettings extends BasicSettings {
     public WindowTinyLfuSettings(Config config) {
       super(config);
     }
@@ -267,9 +263,6 @@ public final class WindowTinyLfuPolicy implements Policy {
     }
     public double percentMainProtected() {
       return config().getDouble("window-tiny-lfu.percent-main-protected");
-    }
-    public double percentFastPath() {
-      return config().getDouble("window-tiny-lfu.percent-fast-path");
     }
   }
 }

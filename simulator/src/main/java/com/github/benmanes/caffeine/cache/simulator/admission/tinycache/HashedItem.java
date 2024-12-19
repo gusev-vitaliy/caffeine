@@ -18,21 +18,21 @@ package com.github.benmanes.caffeine.cache.simulator.admission.tinycache;
 /**
  * This is a wrapper class that represents a parsed hashed item. It contains set - a subtable for
  * the item. chain - a logical index within the set. fingerprint - a value to be stored in the set
- * and chain. This implementation assues fingerprints of 1 byte. .
+ * and chain. This implementation assumes fingerprints of 1 byte. .
  *
  * @author gilga1983@gmail.com (Gil Einziger)
  */
-public class HashedItem {
-  public int set;
-  public byte chainId;
-  public byte fingerprint;
-  public long value;
+final class HashedItem {
+  int set;
+  byte chainId;
+  byte fingerprint;
+  long value;
 
-  public HashedItem(int set, byte chainid, byte fingerprit, long value) {
+  public HashedItem(int set, byte chainId, byte fingerprint, long value) {
     this.set = set;
     this.value = value;
-    this.chainId = chainid;
-    this.fingerprint = fingerprit;
+    this.chainId = chainId;
+    this.fingerprint = fingerprint;
   }
 
   @Override

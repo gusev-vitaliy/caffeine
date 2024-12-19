@@ -15,13 +15,9 @@
  */
 package com.github.benmanes.caffeine.cache;
 
-import java.util.concurrent.ThreadLocalRandom;
+import static com.github.benmanes.caffeine.cache.Caffeine.requireArgument;
 
-import javax.annotation.Nonnegative;
-import javax.annotation.Nonnull;
-import javax.annotation.concurrent.NotThreadSafe;
-
-import com.github.benmanes.caffeine.base.UnsafeAccess;
+import com.google.errorprone.annotations.Var;
 
 /**
  * A probabilistic multiset for estimating the popularity of an element within a time window. The
@@ -30,19 +26,28 @@ import com.github.benmanes.caffeine.base.UnsafeAccess;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-@NotThreadSafe
 final class FrequencySketch<E> {
 
   /*
    * This class maintains a 4-bit CountMinSketch [1] with periodic aging to provide the popularity
    * history for the TinyLfu admission policy [2]. The time and space efficiency of the sketch
-   * allows it to estimate the frequency of an entry in a stream of cache access events.
+   * allows it to cheaply estimate the frequency of an entry in a stream of cache access events.
    *
-   * The counter matrix is represented as a single dimensional array holding 16 counters per slot. A
+   * The counter matrix is represented as a single-dimensional array holding 16 counters per slot. A
    * fixed depth of four balances the accuracy and cost, resulting in a width of four times the
-   * length of the array. To retain an accurate estimation the array's length equals the maximum
+   * length of the array. To retain an accurate estimation, the array's length equals the maximum
    * number of entries in the cache, increased to the closest power-of-two to exploit more efficient
-   * bit masking. This configuration results in a confidence of 93.75% and error bound of e / width.
+   * bit masking. This configuration results in a confidence of 93.75% and an error bound of
+   * e / width.
+   *
+   * To improve hardware efficiency, an item's counters are constrained to a 64-byte block, which is
+   * the size of an L1 cache line. This differs from the theoretical ideal where counters are
+   * uniformly distributed to minimize collisions. In that configuration, the memory accesses are
+   * not predictable and lack spatial locality, which may cause the pipeline to need to wait for
+   * four memory loads. Instead, the items are uniformly distributed to blocks, and each counter is
+   * uniformly selected from a distinct 16-byte segment. While the runtime memory layout may result
+   * in the blocks not being cache-aligned, the L2 spatial prefetcher tries to load aligned pairs of
+   * cache lines, so the typical cost is only one memory access.
    *
    * The frequency of all entries is aged periodically using a sampling window based on the maximum
    * number of entries in the cache. This is referred to as the reset operation by TinyLfu and keeps
@@ -50,69 +55,59 @@ final class FrequencySketch<E> {
    * counters found. The O(n) cost of aging is amortized, ideal for hardware prefetching, and uses
    * inexpensive bit manipulations per array location.
    *
-   * A per instance smear is used to help protect against hash flooding [3], which would result
-   * in the admission policy always rejecting new candidates. The use of a pseudo random hashing
-   * function resolves the concern of a denial of service attack by exploiting the hash codes.
-   *
    * [1] An Improved Data Stream Summary: The Count-Min Sketch and its Applications
    * http://dimacs.rutgers.edu/~graham/pubs/papers/cm-full.pdf
    * [2] TinyLFU: A Highly Efficient Cache Admission Policy
-   * http://www.cs.technion.ac.il/~gilga/TinyLFU_PDP2014.pdf
-   * [3] Denial of Service via Algorithmic Complexity Attack
-   * https://www.usenix.org/legacy/events/sec03/tech/full_papers/crosby/crosby.pdf
+   * https://dl.acm.org/citation.cfm?id=3149371
+   * [3] Hash Function Prospector: Three round functions
+   * https://github.com/skeeto/hash-prospector#three-round-functions
    */
 
-  static final long[] SEED = new long[] { // A mixture of seeds from FNV-1a, CityHash, and Murmur3
-      0xc3a5c85c97cb3127L, 0xb492b66fbe98f273L, 0x9ae16a3b2f90404fL, 0xcbf29ce484222325L};
   static final long RESET_MASK = 0x7777777777777777L;
   static final long ONE_MASK = 0x1111111111111111L;
-  static final int TABLE_SHIFT;
-  static final int TABLE_BASE;
-
-  final int randomSeed;
 
   int sampleSize;
-  int tableMask;
+  int blockMask;
   long[] table;
   int size;
 
   /**
-   * Creates a frequency sketch that can accurately estimate the popularity of elements given
-   * the maximum size of the cache.
-   *
-   * @param maximumSize the maximum size of the cache
+   * Creates a lazily initialized frequency sketch, requiring {@link #ensureCapacity} be called
+   * when the maximum size of the cache has been determined.
    */
-  public FrequencySketch(@Nonnegative long maximumSize) {
-    this(maximumSize, (ThreadLocalRandom.current().nextBoolean() ? 1 : -1)
-        * ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE));
-  }
-
-  FrequencySketch(@Nonnegative long maximumSize, int randomSeed) {
-    Caffeine.requireArgument(randomSeed != 0);
-    this.randomSeed = randomSeed;
-    ensureCapacity(maximumSize);
-  }
+  @SuppressWarnings("NullAway.Init")
+  public FrequencySketch() {}
 
   /**
-   * Increases the capacity of this <tt>FrequencySketch</tt> instance, if necessary, to ensure that
-   * it can accurately estimate the popularity of elements given the maximum size of the cache.
+   * Initializes and increases the capacity of this {@code FrequencySketch} instance, if necessary,
+   * to ensure that it can accurately estimate the popularity of elements given the maximum size of
+   * the cache. This operation forgets all previous counts when resizing.
    *
    * @param maximumSize the maximum size of the cache
    */
-  public void ensureCapacity(@Nonnegative long maximumSize) {
-    Caffeine.requireArgument(maximumSize >= 0);
+  @SuppressWarnings("Varifier")
+  public void ensureCapacity(long maximumSize) {
+    requireArgument(maximumSize >= 0);
     int maximum = (int) Math.min(maximumSize, Integer.MAX_VALUE >>> 1);
     if ((table != null) && (table.length >= maximum)) {
       return;
     }
 
-    table = new long[(maximum == 0) ? 1 : ceilingNextPowerOfTwo(maximum)];
-    tableMask = Math.max(0, table.length - 1);
+    table = new long[Math.max(Caffeine.ceilingPowerOfTwo(maximum), 8)];
     sampleSize = (maximumSize == 0) ? 10 : (10 * maximum);
+    blockMask = (table.length >>> 3) - 1;
     if (sampleSize <= 0) {
       sampleSize = Integer.MAX_VALUE;
     }
     size = 0;
+  }
+
+  /**
+   * Returns if the sketch has not yet been initialized, requiring that {@link #ensureCapacity} is
+   * called before it begins to track frequencies.
+   */
+  public boolean isNotInitialized() {
+    return (table == null);
   }
 
   /**
@@ -121,15 +116,22 @@ final class FrequencySketch<E> {
    * @param e the element to count occurrences of
    * @return the estimated number of occurrences of the element; possibly zero but never negative
    */
-  @Nonnegative
-  public int frequency(@Nonnull E e) {
-    int hash = spread(e.hashCode());
-    int start = (hash & 3) << 2;
-    int frequency = Integer.MAX_VALUE;
+  @SuppressWarnings("Varifier")
+  public int frequency(E e) {
+    if (isNotInitialized()) {
+      return 0;
+    }
+
+    @Var int frequency = Integer.MAX_VALUE;
+    int blockHash = spread(e.hashCode());
+    int counterHash = rehash(blockHash);
+    int block = (blockHash & blockMask) << 3;
     for (int i = 0; i < 4; i++) {
-      int index = indexOf(hash, i);
-      long slot = UnsafeAccess.UNSAFE.getLong(table, byteOffset(index));
-      int count = (int) ((slot >>> ((start + i) << 2)) & 0xfL);
+      int h = counterHash >>> (i << 3);
+      int index = (h >>> 1) & 15;
+      int offset = h & 1;
+      int slot = block + offset + (i << 1);
+      int count = (int) ((table[slot] >>> (index << 2)) & 0xfL);
       frequency = Math.min(frequency, count);
     }
     return frequency;
@@ -137,29 +139,63 @@ final class FrequencySketch<E> {
 
   /**
    * Increments the popularity of the element if it does not exceed the maximum (15). The popularity
-   * of all elements will be periodically down sampled when the observed events exceeds a threshold.
+   * of all elements will be periodically down sampled when the observed events exceed a threshold.
    * This process provides a frequency aging to allow expired long term entries to fade away.
    *
    * @param e the element to add
    */
-  public void increment(@Nonnull E e) {
-    int hash = spread(e.hashCode());
-    int start = (hash & 3) << 2;
+  @SuppressWarnings({"ShortCircuitBoolean", "UnnecessaryLocalVariable"})
+  public void increment(E e) {
+    if (isNotInitialized()) {
+      return;
+    }
 
-    // Loop unrolling improves throughput by 5m ops/s
-    int index0 = indexOf(hash, 0);
-    int index1 = indexOf(hash, 1);
-    int index2 = indexOf(hash, 2);
-    int index3 = indexOf(hash, 3);
+    int blockHash = spread(e.hashCode());
+    int counterHash = rehash(blockHash);
+    int block = (blockHash & blockMask) << 3;
 
-    boolean added = incrementAt(index0, start);
-    added |= incrementAt(index1, start + 1);
-    added |= incrementAt(index2, start + 2);
-    added |= incrementAt(index3, start + 3);
+    // Loop unrolling improves throughput by 10m ops/s
+    int h0 = counterHash;
+    int h1 = counterHash >>> 8;
+    int h2 = counterHash >>> 16;
+    int h3 = counterHash >>> 24;
+
+    int index0 = (h0 >>> 1) & 15;
+    int index1 = (h1 >>> 1) & 15;
+    int index2 = (h2 >>> 1) & 15;
+    int index3 = (h3 >>> 1) & 15;
+
+    int slot0 = block + (h0 & 1);
+    int slot1 = block + (h1 & 1) + 2;
+    int slot2 = block + (h2 & 1) + 4;
+    int slot3 = block + (h3 & 1) + 6;
+
+    boolean added =
+          incrementAt(slot0, index0)
+        | incrementAt(slot1, index1)
+        | incrementAt(slot2, index2)
+        | incrementAt(slot3, index3);
 
     if (added && (++size == sampleSize)) {
       reset();
     }
+  }
+
+  /** Applies a supplemental hash function to defend against a poor quality hash. */
+  static int spread(@Var int x) {
+    x ^= x >>> 17;
+    x *= 0xed5ad4bb;
+    x ^= x >>> 11;
+    x *= 0xac4c1b51;
+    x ^= x >>> 15;
+    return x;
+  }
+
+  /** Applies another round of hashing for additional randomization. */
+  static int rehash(@Var int x) {
+    x *= 0x31848bab;
+    x ^= x >>> 14;
+    return x;
   }
 
   /**
@@ -172,9 +208,8 @@ final class FrequencySketch<E> {
   boolean incrementAt(int i, int j) {
     int offset = j << 2;
     long mask = (0xfL << offset);
-    long slot = UnsafeAccess.UNSAFE.getLong(table, byteOffset(i));
-    if ((slot & mask) != mask) {
-      table[i] = slot + (1L << offset);
+    if ((table[i] & mask) != mask) {
+      table[i] += (1L << offset);
       return true;
     }
     return false;
@@ -182,52 +217,11 @@ final class FrequencySketch<E> {
 
   /** Reduces every counter by half of its original value. */
   void reset() {
-    int count = 0;
+    @Var int count = 0;
     for (int i = 0; i < table.length; i++) {
       count += Long.bitCount(table[i] & ONE_MASK);
       table[i] = (table[i] >>> 1) & RESET_MASK;
     }
-    size = (size >>> 1) - (count >>> 2);
-  }
-
-  /**
-   * Returns the table index for the counter at the specified depth.
-   *
-   * @param item the element's hash
-   * @param i the counter depth
-   * @return the table index
-   */
-  int indexOf(int item, int i) {
-    long hash = SEED[i] * item;
-    hash += hash >> 32;
-    return ((int) hash) & tableMask;
-  }
-
-  /**
-   * Applies a supplemental hash function to a given hashCode, which defends against poor quality
-   * hash functions.
-   */
-  int spread(int x) {
-    x = ((x >>> 16) ^ x) * 0x45d9f3b;
-    x = ((x >>> 16) ^ x) * randomSeed;
-    return (x >>> 16) ^ x;
-  }
-
-  static int ceilingNextPowerOfTwo(int x) {
-    // From Hacker's Delight, Chapter 3, Harry S. Warren Jr.
-    return 1 << (Integer.SIZE - Integer.numberOfLeadingZeros(x - 1));
-  }
-
-  static long byteOffset(int i) {
-    return ((long) i << TABLE_SHIFT) + TABLE_BASE;
-  }
-
-  static {
-    TABLE_BASE = UnsafeAccess.UNSAFE.arrayBaseOffset(long[].class);
-    int scale = UnsafeAccess.UNSAFE.arrayIndexScale(long[].class);
-    if ((scale & (scale - 1)) != 0) {
-      throw new Error("data type scale not a power of two");
-    }
-    TABLE_SHIFT = 31 - Integer.numberOfLeadingZeros(scale);
+    size = (size - (count >>> 2)) >>> 1;
   }
 }

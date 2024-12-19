@@ -17,9 +17,12 @@ package com.github.benmanes.caffeine.cache;
 
 import java.util.AbstractCollection;
 import java.util.Collection;
+import java.util.ConcurrentModificationException;
 import java.util.NoSuchElementException;
 
-import javax.annotation.concurrent.NotThreadSafe;
+import org.jspecify.annotations.Nullable;
+
+import com.google.errorprone.annotations.Var;
 
 /**
  * This class provides a skeletal implementation of the {@link LinkedDeque} interface to minimize
@@ -28,7 +31,6 @@ import javax.annotation.concurrent.NotThreadSafe;
  * @author ben.manes@gmail.com (Ben Manes)
  * @param <E> the type of elements held in this collection
  */
-@NotThreadSafe
 abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements LinkedDeque<E> {
 
   // This class provides a doubly-linked list that is optimized for the virtual machine. The first
@@ -42,22 +44,29 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
    * Invariant: (first == null && last == null) ||
    *            (first.prev == null)
    */
-  E first;
+  @Nullable E first;
 
   /**
    * Pointer to last node.
    * Invariant: (first == null && last == null) ||
    *            (last.next == null)
    */
-  E last;
+  @Nullable E last;
+
+  /**
+   * The number of times this deque has been <i>structurally modified</i>. Structural modifications
+   * are those that change the size of the deque, or otherwise perturb it in such a fashion that
+   * iterations in progress may yield incorrect results.
+   */
+  int modCount;
 
   /**
    * Links the element to the front of the deque so that it becomes the first element.
    *
    * @param e the unlinked element
    */
-  void linkFirst(final E e) {
-    final E f = first;
+  void linkFirst(E e) {
+    E f = first;
     first = e;
 
     if (f == null) {
@@ -66,6 +75,7 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
       setPrevious(f, e);
       setNext(e, f);
     }
+    modCount++;
   }
 
   /**
@@ -73,8 +83,8 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
    *
    * @param e the unlinked element
    */
-  void linkLast(final E e) {
-    final E l = last;
+  void linkLast(E e) {
+    E l = last;
     last = e;
 
     if (l == null) {
@@ -83,12 +93,14 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
       setNext(l, e);
       setPrevious(e, l);
     }
+    modCount++;
   }
 
   /** Unlinks the non-null first element. */
+  @SuppressWarnings("NullAway")
   E unlinkFirst() {
-    final E f = first;
-    final E next = getNext(f);
+    E f = first;
+    E next = getNext(f);
     setNext(f, null);
 
     first = next;
@@ -97,13 +109,15 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
     } else {
       setPrevious(next, null);
     }
+    modCount++;
     return f;
   }
 
   /** Unlinks the non-null last element. */
+  @SuppressWarnings("NullAway")
   E unlinkLast() {
-    final E l = last;
-    final E prev = getPrevious(l);
+    E l = last;
+    E prev = getPrevious(l);
     setPrevious(l, null);
     last = prev;
     if (prev == null) {
@@ -111,13 +125,14 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
     } else {
       setNext(prev, null);
     }
+    modCount++;
     return l;
   }
 
   /** Unlinks the non-null element. */
   void unlink(E e) {
-    final E prev = getPrevious(e);
-    final E next = getNext(e);
+    E prev = getPrevious(e);
+    E next = getNext(e);
 
     if (prev == null) {
       first = next;
@@ -132,6 +147,7 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
       setPrevious(next, prev);
       setNext(e, null);
     }
+    modCount++;
   }
 
   @Override
@@ -152,7 +168,7 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
    */
   @Override
   public int size() {
-    int size = 0;
+    @Var int size = 0;
     for (E e = first; e != null; e = getNext(e)) {
       size++;
     }
@@ -161,25 +177,27 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
 
   @Override
   public void clear() {
-    for (E e = first; e != null;) {
+    @Var E e = first;
+    while (e != null) {
       E next = getNext(e);
       setPrevious(e, null);
       setNext(e, null);
       e = next;
     }
     first = last = null;
+    modCount++;
   }
 
   @Override
   public abstract boolean contains(Object o);
 
   @Override
-  public boolean isFirst(E e) {
+  public boolean isFirst(@Nullable E e) {
     return (e != null) && (e == first);
   }
 
   @Override
-  public boolean isLast(E e) {
+  public boolean isLast(@Nullable E e) {
     return (e != null) && (e == last);
   }
 
@@ -200,27 +218,29 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
   }
 
   @Override
-  public E peek() {
+  public @Nullable E peek() {
     return peekFirst();
   }
 
   @Override
-  public E peekFirst() {
+  public @Nullable E peekFirst() {
     return first;
   }
 
   @Override
-  public E peekLast() {
+  public @Nullable E peekLast() {
     return last;
   }
 
   @Override
+  @SuppressWarnings("NullAway")
   public E getFirst() {
     checkNotEmpty();
     return peekFirst();
   }
 
   @Override
+  @SuppressWarnings("NullAway")
   public E getLast() {
     checkNotEmpty();
     return peekLast();
@@ -274,17 +294,17 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
   }
 
   @Override
-  public E poll() {
+  public @Nullable E poll() {
     return pollFirst();
   }
 
   @Override
-  public E pollFirst() {
+  public @Nullable E pollFirst() {
     return isEmpty() ? null : unlinkFirst();
   }
 
   @Override
-  public E pollLast() {
+  public @Nullable E pollLast() {
     return isEmpty() ? null : unlinkLast();
   }
 
@@ -294,10 +314,14 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
   }
 
   @Override
+  @SuppressWarnings("NullAway")
   public E removeFirst() {
     checkNotEmpty();
     return pollFirst();
   }
+
+  @Override
+  public abstract boolean remove(Object o);
 
   @Override
   public boolean removeFirstOccurrence(Object o) {
@@ -305,6 +329,7 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
   }
 
   @Override
+  @SuppressWarnings("NullAway")
   public E removeLast() {
     checkNotEmpty();
     return pollLast();
@@ -317,7 +342,7 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
 
   @Override
   public boolean removeAll(Collection<?> c) {
-    boolean modified = false;
+    @Var boolean modified = false;
     for (Object o : c) {
       modified |= remove(o);
     }
@@ -337,7 +362,8 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
   @Override
   public PeekingIterator<E> iterator() {
     return new AbstractLinkedIterator(first) {
-      @Override E computeNext() {
+      @SuppressWarnings("NullAway")
+      @Override @Nullable E computeNext() {
         return getNext(cursor);
       }
     };
@@ -346,50 +372,74 @@ abstract class AbstractLinkedDeque<E> extends AbstractCollection<E> implements L
   @Override
   public PeekingIterator<E> descendingIterator() {
     return new AbstractLinkedIterator(last) {
-      @Override E computeNext() {
+      @SuppressWarnings("NullAway")
+      @Override @Nullable E computeNext() {
         return getPrevious(cursor);
       }
     };
   }
 
   abstract class AbstractLinkedIterator implements PeekingIterator<E> {
-    E cursor;
+    @Nullable E previous;
+    @Nullable E cursor;
+
+    int expectedModCount;
 
     /**
      * Creates an iterator that can can traverse the deque.
      *
      * @param start the initial element to begin traversal from
      */
-    AbstractLinkedIterator(E start) {
+    AbstractLinkedIterator(@Nullable E start) {
+      expectedModCount = modCount;
       cursor = start;
     }
 
     @Override
     public boolean hasNext() {
+      checkForComodification();
       return (cursor != null);
     }
 
     @Override
-    public E peek() {
+    public @Nullable E peek() {
       return cursor;
     }
 
     @Override
+    @SuppressWarnings("NullAway")
     public E next() {
       if (!hasNext()) {
         throw new NoSuchElementException();
       }
-      E e = cursor;
+      previous = cursor;
       cursor = computeNext();
-      return e;
+      return previous;
     }
+
+    /** Retrieves the next element to traverse to or {@code null} if there are no more elements. */
+    abstract @Nullable E computeNext();
 
     @Override
     public void remove() {
-      throw new UnsupportedOperationException();
+      if (previous == null) {
+        throw new IllegalStateException();
+      }
+      checkForComodification();
+
+      AbstractLinkedDeque.this.remove(previous);
+      expectedModCount = modCount;
+      previous = null;
     }
 
-    /** Retrieves the next element to traverse to or <tt>null</tt> if there are no more elements. */
-    abstract E computeNext();
+    /**
+     * If the expected modCount value that the iterator believes that the backing deque should have
+     * is violated then the iterator has detected concurrent modification.
+     */
+    void checkForComodification() {
+      if (modCount != expectedModCount) {
+        throw new ConcurrentModificationException();
+      }
+    }
   }
 }

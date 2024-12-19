@@ -15,9 +15,9 @@
  */
 package com.github.benmanes.caffeine.cache.node;
 
-import javax.lang.model.element.Modifier;
-
 import com.github.benmanes.caffeine.cache.Feature;
+import com.github.benmanes.caffeine.cache.node.NodeContext.Strength;
+import com.github.benmanes.caffeine.cache.node.NodeContext.Visibility;
 import com.squareup.javapoet.MethodSpec;
 import com.squareup.javapoet.TypeName;
 
@@ -26,45 +26,47 @@ import com.squareup.javapoet.TypeName;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class AddMaximum extends NodeRule {
+public final class AddMaximum implements NodeRule {
 
   @Override
-  protected boolean applies() {
+  public boolean applies(NodeContext context) {
     return Feature.usesMaximum(context.generateFeatures);
   }
 
   @Override
-  protected void execute() {
-    addMoveCount();
-    addWeight();
+  public void execute(NodeContext context) {
+    addQueueFlag(context);
+    addWeight(context);
   }
 
-  private void addMoveCount() {
-    context.nodeSubtype.addField(int.class, "moveCount", Modifier.PRIVATE);
-    context.nodeSubtype.addMethod(MethodSpec.methodBuilder("getMoveCount")
-        .addModifiers(Modifier.PUBLIC, Modifier.FINAL)
+  private static void addQueueFlag(NodeContext context) {
+    context.nodeSubtype.addField(int.class, "queueType");
+    context.nodeSubtype.addMethod(MethodSpec.methodBuilder("getQueueType")
+        .addModifiers(context.publicFinalModifiers())
         .returns(int.class)
-        .addStatement("return moveCount")
+        .addStatement("return queueType")
         .build());
-    context.nodeSubtype.addMethod(MethodSpec.methodBuilder("setMoveCount")
-        .addModifiers(Modifier.PUBLIC, Modifier.FINAL)
-        .addParameter(int.class, "moveCount")
-        .addStatement("this.moveCount = moveCount")
+    context.nodeSubtype.addMethod(MethodSpec.methodBuilder("setQueueType")
+        .addModifiers(context.publicFinalModifiers())
+        .addParameter(int.class, "queueType")
+        .addStatement("this.queueType = queueType")
         .build());
   }
 
-  private void addWeight() {
+  private static void addWeight(NodeContext context) {
     if (!context.generateFeatures.contains(Feature.MAXIMUM_WEIGHT)) {
       return;
     }
-    context.nodeSubtype.addField(int.class, "weight", Modifier.PRIVATE)
-        .addMethod(newGetter(Strength.STRONG, TypeName.INT, "weight", Visibility.IMMEDIATE))
-        .addMethod(newSetter(TypeName.INT, "weight", Visibility.IMMEDIATE));
+    context.nodeSubtype.addField(int.class, "weight")
+        .addMethod(context.newGetter(Strength.STRONG,
+            TypeName.INT, "weight", Visibility.VOLATILE))
+        .addMethod(context.newSetter(TypeName.INT, "weight", Visibility.VOLATILE));
     context.constructorByKey.addStatement("this.$N = $N", "weight", "weight");
     context.constructorByKeyRef.addStatement("this.$N = $N", "weight", "weight");
 
-    context.nodeSubtype.addField(int.class, "policyWeight", Modifier.PRIVATE)
-        .addMethod(newGetter(Strength.STRONG, TypeName.INT, "policyWeight", Visibility.IMMEDIATE))
-        .addMethod(newSetter(TypeName.INT, "policyWeight", Visibility.IMMEDIATE));
+    context.nodeSubtype.addField(int.class, "policyWeight")
+        .addMethod(context.newGetter(Strength.STRONG,
+            TypeName.INT, "policyWeight", Visibility.VOLATILE))
+        .addMethod(context.newSetter(TypeName.INT, "policyWeight", Visibility.VOLATILE));
   }
 }

@@ -16,116 +16,142 @@
 package com.github.benmanes.caffeine.cache.testing;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static java.util.Objects.requireNonNull;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Map.Entry;
-import java.util.Objects;
-import java.util.concurrent.ConcurrentMap;
-import java.util.logging.LogManager;
 import java.util.stream.Stream;
 
 import org.testng.annotations.DataProvider;
 
+import com.github.benmanes.caffeine.cache.AsyncCache;
 import com.github.benmanes.caffeine.cache.AsyncLoadingCache;
-import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.github.benmanes.caffeine.cache.Policy;
-import com.github.benmanes.caffeine.cache.testing.CacheSpec.Compute;
+import com.google.common.collect.ImmutableSet;
 
 /**
- * A data provider that generates caches based on the {@link CacheSpec} configuration.
+ * A data provider that generates caches based on the test method's parameters and the
+ * {@link CacheSpec} configuration.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
 public final class CacheProvider {
+  private static final Class<?> BOUNDED_LOCAL_CACHE =
+      classForName("com.github.benmanes.caffeine.cache.BoundedLocalCache");
+  private static final ImmutableSet<Class<?>> GUAVA_INCOMPATIBLE = ImmutableSet.of(
+      AsyncCache.class, AsyncLoadingCache.class, BOUNDED_LOCAL_CACHE, Policy.Eviction.class,
+      Policy.FixedExpiration.class, Policy.VarExpiration.class, Policy.FixedRefresh.class);
 
-  static {
-    // disable logging warnings caused by exceptions in asynchronous computations
-    LogManager.getLogManager().reset();
+  private final Parameter[] parameters;
+  private final Method testMethod;
+
+  private CacheProvider(Method testMethod) {
+    this.parameters = testMethod.getParameters();
+    this.testMethod = testMethod;
   }
 
-  private CacheProvider() {}
-
-  /** Returns the lazily generated test scenarios. */
+  /** Returns the lazily generated test parameters. */
   @DataProvider(name = "caches")
-  public static Iterator<Object[]> providesCaches(Method testMethod) throws Exception {
-    CacheGenerator generator = newCacheGenerator(testMethod);
-    return asTestCases(testMethod, generator.generate());
+  public static Iterator<Object[]> providesCaches(Method testMethod) {
+    return new CacheProvider(testMethod).getTestCases();
   }
 
-  /** Returns a new cache generator. */
-  private static CacheGenerator newCacheGenerator(Method testMethod) {
-    CacheSpec cacheSpec = testMethod.getAnnotation(CacheSpec.class);
-    requireNonNull(cacheSpec, "@CacheSpec not found");
-    Options options = Options.fromSystemProperties();
+  /** Returns the parameters for the test case scenarios. */
+  private Iterator<Object[]> getTestCases() {
+    return scenarios()
+        .map(this::asTestCases)
+        .filter(params -> params.length > 0)
+        .iterator();
+  }
 
-    // Inspect the test parameters for interface constraints (loading, async)
-    boolean isAsyncLoadingOnly = hasCacheOfType(testMethod, AsyncLoadingCache.class);
-    boolean isLoadingOnly = isAsyncLoadingOnly
-        || hasCacheOfType(testMethod, LoadingCache.class)
-        || options.compute().filter(Compute.ASYNC::equals).isPresent();
-
-    return new CacheGenerator(cacheSpec, options, isLoadingOnly, isAsyncLoadingOnly);
+  /** Returns the test scenarios. */
+  private Stream<CacheContext> scenarios() {
+    var cacheSpec = checkNotNull(testMethod.getAnnotation(CacheSpec.class), "@CacheSpec not found");
+    var generator = new CacheGenerator(cacheSpec, Options.fromSystemProperties(),
+        isLoadingOnly(), isAsyncOnly(), isGuavaCompatible());
+    return generator.generate();
   }
 
   /**
-   * Converts each scenario into test case parameters. Supports injecting {@link LoadingCache},
-   * {@link Cache}, {@link CacheContext}, the {@link ConcurrentMap} {@link Cache#asMap()} view,
-   * {@link Policy.Eviction}, and {@link Policy.Expiration}.
+   * Returns the test case parameters based on the method parameter types or an empty array if
+   * incompatible.
    */
-  private static Iterator<Object[]> asTestCases(Method testMethod,
-      Stream<Entry<CacheContext, Cache<Integer, Integer>>> scenarios) {
-    Parameter[] parameters = testMethod.getParameters();
-    CacheContext[] stashed = new CacheContext[1];
-    return scenarios.map(entry -> {
-      // Retain a strong reference to the context throughout the test execution so that the
-      // cache entries are not collected due to the test not accepting the context parameter
-      stashed[0] = entry.getKey();
-
-      Object[] params = new Object[parameters.length];
-      for (int i = 0; i < params.length; i++) {
-        Class<?> clazz = parameters[i].getType();
-        if (clazz.isAssignableFrom(CacheContext.class)) {
-          params[i] = entry.getKey();
-        } else if (clazz.isAssignableFrom(entry.getValue().getClass())) {
-          params[i] = entry.getValue(); // Cache or LoadingCache
-        } else if (clazz.isAssignableFrom(AsyncLoadingCache.class)) {
-          params[i] = entry.getKey().asyncCache;
-        } else if (clazz.isAssignableFrom(Map.class)) {
-          params[i] = entry.getValue().asMap();
-        } else if (clazz.isAssignableFrom(Policy.Eviction.class)) {
-          params[i] = entry.getValue().policy().eviction().get();
-        } else if (clazz.isAssignableFrom(Policy.Expiration.class)) {
-          params[i] = expirationPolicy(parameters[i], entry);
+  private Object[] asTestCases(CacheContext context) {
+    boolean intern = true;
+    CacheGenerator.initialize(context);
+    var params = new Object[parameters.length];
+    for (int i = 0; i < parameters.length; i++) {
+      Class<?> clazz = parameters[i].getType();
+      if (clazz.isInstance(context)) {
+        params[i] = context;
+        intern = false;
+      } else if (clazz.isInstance(context.cache())) {
+        params[i] = context.cache();
+      } else if (clazz.isInstance(context.asyncCache)) {
+        params[i] = context.asyncCache;
+      } else if (clazz.isAssignableFrom(Map.class)) {
+        params[i] = context.cache().asMap();
+      } else if (clazz.isAssignableFrom(BOUNDED_LOCAL_CACHE)) {
+        if (!BOUNDED_LOCAL_CACHE.isInstance(context.cache().asMap())) {
+          return new Object[] {};
         }
-        if (params[i] == null) {
-          checkNotNull(params[i], "Unknown parameter type: %s", clazz);
+        params[i] = context.cache().asMap();
+      } else if (clazz.isAssignableFrom(Policy.Eviction.class)) {
+        params[i] = context.cache().policy().eviction().orElseThrow();
+      } else if (clazz.isAssignableFrom(Policy.VarExpiration.class)) {
+        params[i] = context.cache().policy().expireVariably().orElseThrow();
+      } else if (clazz.isAssignableFrom(Policy.FixedRefresh.class)) {
+        params[i] = context.cache().policy().refreshAfterWrite().orElseThrow();
+      } else if (clazz.isAssignableFrom(Policy.FixedExpiration.class)) {
+        if (parameters[i].isAnnotationPresent(ExpireAfterAccess.class)) {
+          params[i] = context.cache().policy().expireAfterAccess().orElseThrow();
+        } else if (parameters[i].isAnnotationPresent(ExpireAfterWrite.class)) {
+          params[i] = context.cache().policy().expireAfterWrite().orElseThrow();
+        } else {
+          throw new AssertionError("FixedExpiration must have a qualifier annotation");
         }
       }
-      return params;
-    }).filter(Objects::nonNull).iterator();
-  }
-
-  /** Returns the expiration policy for the given parameter. */
-  private static Policy.Expiration<Integer, Integer> expirationPolicy(
-      Parameter parameter, Entry<CacheContext, Cache<Integer, Integer>> entry) {
-    if (parameter.isAnnotationPresent(ExpireAfterAccess.class)) {
-      return entry.getValue().policy().expireAfterAccess().get();
-    } else if (parameter.isAnnotationPresent(ExpireAfterWrite.class)) {
-      return entry.getValue().policy().expireAfterWrite().get();
-    } else if (parameter.isAnnotationPresent(RefreshAfterWrite.class)) {
-      return entry.getValue().policy().refreshAfterWrite().get();
+      if (params[i] == null) {
+        checkNotNull(params[i], "Unknown parameter type: %s", clazz);
+      }
     }
-    throw new AssertionError("Expiration parameter must have a qualifier annotation");
+    if (intern) {
+      // Retain a strong reference to the context throughout the test execution so that the
+      // cache entries are not collected due to the test not accepting the context parameter
+      CacheContext.intern(context);
+    }
+    return params;
   }
 
-  /** Returns if the required cache matches the provided type. */
-  private static boolean hasCacheOfType(Method testMethod, Class<?> cacheType) {
-    return Arrays.stream(testMethod.getParameterTypes()).anyMatch(cacheType::isAssignableFrom);
+  /** Returns if the test parameters requires an asynchronous cache. */
+  private boolean isAsyncOnly() {
+    return hasParameterOfType(AsyncCache.class);
+  }
+
+  /** Returns if the test parameters requires a loading cache. */
+  private boolean isLoadingOnly() {
+    return hasParameterOfType(AsyncLoadingCache.class) || hasParameterOfType(LoadingCache.class);
+  }
+
+  /** Returns if the required cache is compatible with the Guava test adapters. */
+  private boolean isGuavaCompatible() {
+    return Arrays.stream(parameters)
+        .noneMatch(parameter -> GUAVA_INCOMPATIBLE.contains(parameter.getType()));
+  }
+
+  /** Returns if the class matches a parameter type. */
+  private boolean hasParameterOfType(Class<?> clazz) {
+    return Arrays.stream(parameters).map(Parameter::getType).anyMatch(clazz::isAssignableFrom);
+  }
+
+  private static Class<?> classForName(String className) {
+    try {
+      return Class.forName(className);
+    } catch (ClassNotFoundException e) {
+      throw new AssertionError(e);
+    }
   }
 }

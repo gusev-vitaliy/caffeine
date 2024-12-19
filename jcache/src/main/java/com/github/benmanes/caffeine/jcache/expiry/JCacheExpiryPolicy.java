@@ -20,10 +20,10 @@ import static java.util.Objects.requireNonNull;
 import java.io.Serializable;
 import java.util.Objects;
 
-import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
 import javax.cache.expiry.Duration;
 import javax.cache.expiry.ExpiryPolicy;
+
+import org.jspecify.annotations.Nullable;
 
 /**
  * A customized expiration policy.
@@ -34,10 +34,10 @@ public final class JCacheExpiryPolicy implements ExpiryPolicy, Serializable {
   private static final long serialVersionUID = 1L;
 
   private final Duration creation;
-  private final Duration update;
-  private final Duration access;
+  private final @Nullable Duration update;
+  private final @Nullable Duration access;
 
-  public JCacheExpiryPolicy(@Nonnull Duration creation, 
+  public JCacheExpiryPolicy(Duration creation,
       @Nullable Duration update, @Nullable Duration access) {
     this.creation = requireNonNull(creation);
     this.update = update;
@@ -50,23 +50,23 @@ public final class JCacheExpiryPolicy implements ExpiryPolicy, Serializable {
   }
 
   @Override
-  public Duration getExpiryForUpdate() {
+  public @Nullable Duration getExpiryForUpdate() {
     return update;
   }
 
   @Override
-  public Duration getExpiryForAccess() {
+  public @Nullable Duration getExpiryForAccess() {
     return access;
   }
 
   @Override
-  public boolean equals(Object o) {
+  public boolean equals(@Nullable Object o) {
     if (o == this) {
       return true;
     } else if (!(o instanceof ExpiryPolicy)) {
       return false;
     }
-    ExpiryPolicy policy = (ExpiryPolicy) o;
+    var policy = (ExpiryPolicy) o;
     return Objects.equals(creation, policy.getExpiryForCreation())
         && Objects.equals(update, policy.getExpiryForUpdate())
         && Objects.equals(access, policy.getExpiryForAccess());

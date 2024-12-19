@@ -19,8 +19,9 @@ import java.util.Random;
 
 import com.github.benmanes.caffeine.cache.BasicCache;
 import com.github.benmanes.caffeine.cache.CacheType;
-import com.yahoo.ycsb.generator.IntegerGenerator;
-import com.yahoo.ycsb.generator.ScrambledZipfianGenerator;
+
+import site.ycsb.generator.NumberGenerator;
+import site.ycsb.generator.ScrambledZipfianGenerator;
 
 /**
  * A hook for profiling caches.
@@ -40,11 +41,18 @@ public final class CacheProfiler extends ProfilerHook {
   final boolean reads;
 
   CacheProfiler() {
-    ints = new Integer[SIZE];
     cache = cacheType.create(2 * SIZE);
-    IntegerGenerator generator = new ScrambledZipfianGenerator(ITEMS);
+
+    // Ensure full initialization of internal structures
+    for (int i = 0; i < 2 * SIZE; i++) {
+      cache.put(i, Boolean.TRUE);
+    }
+    cache.clear();
+
+    ints = new Integer[SIZE];
+    NumberGenerator generator = new ScrambledZipfianGenerator(ITEMS);
     for (int i = 0; i < SIZE; i++) {
-      ints[i] = generator.nextInt();
+      ints[i] = generator.nextValue().intValue();
       cache.put(ints[i], Boolean.TRUE);
     }
 
@@ -61,6 +69,7 @@ public final class CacheProfiler extends ProfilerHook {
   }
 
   /** Spins forever reading from the cache. */
+  @SuppressWarnings("CheckReturnValue")
   private void reads() {
     int index = random.nextInt();
     for (;;) {
@@ -81,7 +90,7 @@ public final class CacheProfiler extends ProfilerHook {
   }
 
   public static void main(String[] args) {
-    CacheProfiler profile = new CacheProfiler();
+    var profile = new CacheProfiler();
     profile.run();
   }
 }

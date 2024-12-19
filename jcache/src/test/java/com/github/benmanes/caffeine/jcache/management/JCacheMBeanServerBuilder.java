@@ -26,8 +26,6 @@ import javax.management.Notification;
 import javax.management.NotificationFilter;
 import javax.management.NotificationListener;
 
-import com.sun.jmx.mbeanserver.JmxMBeanServer;
-
 /**
  * An MBeanServer for the TCK that sets the mbean server id to the value of the
  * <code>org.jsr107.tck.management.agentId</code> system property.
@@ -40,7 +38,7 @@ public final class JCacheMBeanServerBuilder extends MBeanServerBuilder {
   public MBeanServer newMBeanServer(String defaultDomain,
       MBeanServer outer, MBeanServerDelegate delegate) {
     MBeanServerDelegate jcacheDelegate = new JCacheMBeanServerDelegate(delegate);
-    return JmxMBeanServer.newMBeanServer(defaultDomain, outer, jcacheDelegate, false);
+    return new MBeanServerBuilder().newMBeanServer(defaultDomain, outer, jcacheDelegate);
   }
 
   private static final class JCacheMBeanServerDelegate extends MBeanServerDelegate {
@@ -86,19 +84,19 @@ public final class JCacheMBeanServerBuilder extends MBeanServerBuilder {
     }
 
     @Override
-    public void addNotificationListener(NotificationListener listener,
+    public synchronized void addNotificationListener(NotificationListener listener,
         NotificationFilter filter, Object handback) {
       delegate.addNotificationListener(listener, filter, handback);
     }
 
     @Override
-    public void removeNotificationListener(NotificationListener listener,
+    public synchronized void removeNotificationListener(NotificationListener listener,
         NotificationFilter filter, Object handback) throws ListenerNotFoundException {
       delegate.removeNotificationListener(listener, filter, handback);
     }
 
     @Override
-    public void removeNotificationListener(NotificationListener listener)
+    public synchronized void removeNotificationListener(NotificationListener listener)
         throws ListenerNotFoundException {
       delegate.removeNotificationListener(listener);
     }
@@ -109,7 +107,7 @@ public final class JCacheMBeanServerBuilder extends MBeanServerBuilder {
     }
 
     @Override
-    public String getMBeanServerId() {
+    public synchronized String getMBeanServerId() {
       return System.getProperty("org.jsr107.tck.management.agentId");
     }
   }

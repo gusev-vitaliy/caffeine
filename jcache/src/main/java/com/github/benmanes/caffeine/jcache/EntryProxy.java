@@ -20,7 +20,7 @@ import java.util.AbstractMap.SimpleImmutableEntry;
 import javax.cache.Cache;
 
 /**
- * An implementation of JSR-107 {@link Cache.Entry}.
+ * An implementation of JSR-107 {@link javax.cache.Cache.Entry}.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
@@ -38,7 +38,7 @@ public final class EntryProxy<K, V> extends SimpleImmutableEntry<K, V>
       throw new IllegalArgumentException("Class " + clazz + " is unknown to this implementation");
     }
     @SuppressWarnings("unchecked")
-    T castedEntry = (T) this;
+    var castedEntry = (T) this;
     return castedEntry;
   }
 }

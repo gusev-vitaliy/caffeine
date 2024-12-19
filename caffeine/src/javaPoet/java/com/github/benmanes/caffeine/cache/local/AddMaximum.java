@@ -16,94 +16,87 @@
 package com.github.benmanes.caffeine.cache.local;
 
 import static com.github.benmanes.caffeine.cache.Specifications.FREQUENCY_SKETCH;
-import static com.github.benmanes.caffeine.cache.Specifications.UNSAFE_ACCESS;
-import static com.github.benmanes.caffeine.cache.Specifications.newFieldOffset;
-import static com.github.benmanes.caffeine.cache.Specifications.offsetName;
 import static org.apache.commons.lang3.StringUtils.capitalize;
 
+import javax.lang.model.element.Modifier;
+
 import com.github.benmanes.caffeine.cache.Feature;
+import com.squareup.javapoet.CodeBlock;
 import com.squareup.javapoet.FieldSpec;
 import com.squareup.javapoet.MethodSpec;
 
 /**
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class AddMaximum extends LocalCacheRule {
+public final class AddMaximum implements LocalCacheRule {
 
   @Override
-  protected boolean applies() {
-    if (Feature.usesMaximum(context.parentFeatures)
-        || !Feature.usesMaximum(context.generateFeatures)) {
-      return false;
-    }
-    return true;
+  public boolean applies(LocalCacheContext context) {
+    return !(Feature.usesMaximum(context.parentFeatures)
+        || !Feature.usesMaximum(context.generateFeatures));
   }
 
   @Override
-  protected void execute() {
-    addEvicts();
-    addMaximum("");
-    addMaximum("eden");
-    addMaximum("mainProtected");
-    addWeightedSize("");
-    addWeightedSize("eden");
-    addWeightedSize("mainProtected");
-    addFrequencySketch();
+  public void execute(LocalCacheContext context) {
+    addEvicts(context);
+    addMaximumSize(context);
+    addHillClimber(context);
+    addFrequencySketch(context);
   }
 
-  private void addEvicts() {
+  private static void addEvicts(LocalCacheContext context) {
     context.cache.addMethod(MethodSpec.methodBuilder("evicts")
-        .addModifiers(protectedFinalModifiers)
+        .addModifiers(context.protectedFinalModifiers())
         .addStatement("return true")
         .returns(boolean.class)
         .build());
   }
 
-  private void addMaximum(String prefix) {
-    String varName = prefix.isEmpty() ? "maximum" : prefix + "Maximum";
-    context.cache.addField(FieldSpec.builder(
-        long.class, varName, privateVolatileModifiers).build());
-    context.cache.addField(newFieldOffset(context.className, varName));
-    context.cache.addMethod(MethodSpec.methodBuilder(varName)
-        .addModifiers(protectedFinalModifiers)
-        .addStatement("return $T.UNSAFE.getLong(this, $N)", UNSAFE_ACCESS, offsetName(varName))
-        .returns(long.class)
-        .build());
-    context.cache.addMethod(MethodSpec.methodBuilder("lazySet" + capitalize(varName))
-        .addModifiers(protectedFinalModifiers)
-        .addStatement("$T.UNSAFE.putLong(this, $N, $N)",
-            UNSAFE_ACCESS, offsetName(varName), varName)
-        .addParameter(long.class, varName)
-        .build());
+  private static void addMaximumSize(LocalCacheContext context) {
+    addField(context, long.class, "maximum");
+    addField(context, long.class, "weightedSize");
+    addField(context, long.class, "windowMaximum");
+    addField(context, long.class, "windowWeightedSize");
+    addField(context, long.class, "mainProtectedMaximum");
+    addField(context, long.class, "mainProtectedWeightedSize");
   }
 
-  private void addWeightedSize(String prefix) {
-    String varName = prefix.isEmpty() ? "weightedSize" : prefix + "WeightedSize";
-    context.cache.addField(FieldSpec.builder(
-        long.class, varName, privateVolatileModifiers).build());
-    context.cache.addField(newFieldOffset(context.className, varName));
-    context.cache.addMethod(MethodSpec.methodBuilder(varName)
-        .addModifiers(protectedFinalModifiers)
-        .addStatement("return $T.UNSAFE.getLong(this, $N)", UNSAFE_ACCESS, offsetName(varName))
-        .returns(long.class)
-        .build());
-    context.cache.addMethod(MethodSpec.methodBuilder("lazySet" + capitalize(varName))
-        .addModifiers(protectedFinalModifiers)
-        .addStatement("$T.UNSAFE.putLong(this, $N, $N)",
-            UNSAFE_ACCESS, offsetName(varName), varName)
-        .addParameter(long.class, varName)
-        .build());
+  private static void addHillClimber(LocalCacheContext context) {
+    addField(context, double.class, "stepSize");
+    addField(context, long.class, "adjustment");
+    addField(context, int.class, "hitsInSample");
+    addField(context, int.class, "missesInSample");
+    addField(context, double.class, "previousSampleHitRate");
   }
 
-  private void addFrequencySketch() {
+  private static void addFrequencySketch(LocalCacheContext context) {
     context.cache.addField(FieldSpec.builder(
-        FREQUENCY_SKETCH, "sketch", privateFinalModifiers).build());
-    context.constructor.addStatement(
-        "this.sketch = new $T(builder.getInitialCapacity())", FREQUENCY_SKETCH);
+        FREQUENCY_SKETCH, "sketch", Modifier.FINAL).build());
+    context.constructor.addCode(CodeBlock.builder()
+        .addStatement("this.sketch = new $T()", FREQUENCY_SKETCH)
+        .beginControlFlow("if (builder.hasInitialCapacity())")
+            .addStatement("long capacity = Math.min($L, $L)",
+                "builder.getMaximum()", "builder.getInitialCapacity()")
+            .addStatement("this.sketch.ensureCapacity(capacity)")
+        .endControlFlow().build());
     context.cache.addMethod(MethodSpec.methodBuilder("frequencySketch")
-        .addModifiers(protectedFinalModifiers)
+        .addModifiers(context.protectedFinalModifiers())
         .addStatement("return sketch")
         .returns(FREQUENCY_SKETCH)
+        .build());
+  }
+
+  private static void addField(LocalCacheContext context, Class<?> type, String name) {
+    context.cache.addField(FieldSpec.builder(type, name).build());
+    context.cache.addMethod(MethodSpec.methodBuilder(name)
+        .addModifiers(context.protectedFinalModifiers())
+        .addStatement("return $L", name)
+        .returns(type)
+        .build());
+    context.cache.addMethod(MethodSpec.methodBuilder("set" + capitalize(name))
+        .addModifiers(context.protectedFinalModifiers())
+        .addParameter(type, name)
+        .addStatement("this.$1L = $1L", name)
         .build());
   }
 }

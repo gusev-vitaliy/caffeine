@@ -15,15 +15,17 @@
  */
 package com.github.benmanes.caffeine.cache.simulator.policy.product;
 
+import static com.github.benmanes.caffeine.cache.simulator.policy.Policy.Characteristic.WEIGHTED;
+
 import java.util.Set;
-import java.util.concurrent.ExecutionException;
 
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
+import com.github.benmanes.caffeine.cache.simulator.policy.AccessEvent;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
-import com.google.common.collect.ImmutableSet;
 import com.typesafe.config.Config;
 
 /**
@@ -31,40 +33,36 @@ import com.typesafe.config.Config;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@PolicySpec(name = "product.Guava", characteristics = WEIGHTED)
 public final class GuavaPolicy implements Policy {
-  private final Cache<Object, Object> cache;
+  private final Cache<Long, AccessEvent> cache;
   private final PolicyStats policyStats;
 
-  public GuavaPolicy(Config config) {
-    policyStats = new PolicyStats("product.Guava");
-    BasicSettings settings = new BasicSettings(config);
-    cache = CacheBuilder.newBuilder()
-        .maximumSize(settings.maximumSize())
-        .initialCapacity(settings.maximumSize())
-        .removalListener(notification -> policyStats.recordEviction())
-        .build();
-  }
-
-  /** Returns all variations of this policy based on the configuration parameters. */
-  public static Set<Policy> policies(Config config) {
-    return ImmutableSet.of(new GuavaPolicy(config));
+  public GuavaPolicy(Config config, Set<Characteristic> characteristics) {
+    policyStats = new PolicyStats(name());
+    var settings = new BasicSettings(config);
+    CacheBuilder<Long, AccessEvent> builder = CacheBuilder.newBuilder()
+        .removalListener(notification -> policyStats.recordEviction());
+    if (characteristics.contains(WEIGHTED)) {
+      builder.maximumWeight(settings.maximumSize());
+      builder.weigher((key, value) -> value.weight());
+    } else {
+      builder.maximumSize(settings.maximumSize());
+    }
+    cache = builder.build();
   }
 
   @Override
-  public void record(long key) {
-    boolean[] hit = { true };
-    try {
-      cache.get(key, () -> {
-        hit[0] = false;
-        return key;
-      });
-    } catch (ExecutionException e) {
-      throw new RuntimeException(e);
-    }
-    if (hit[0]) {
-      policyStats.recordHit();
+  public void record(AccessEvent event) {
+    AccessEvent value = cache.getIfPresent(event.key());
+    if (value == null) {
+      cache.put(event.key(), event);
+      policyStats.recordWeightedMiss(event.weight());
     } else {
-      policyStats.recordMiss();
+      policyStats.recordWeightedHit(event.weight());
+      if (event.weight() != value.weight()) {
+        cache.put(event.key(), event);
+      }
     }
   }
 

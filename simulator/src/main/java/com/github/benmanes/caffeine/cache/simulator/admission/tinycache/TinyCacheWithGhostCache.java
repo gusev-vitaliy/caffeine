@@ -17,126 +17,126 @@ package com.github.benmanes.caffeine.cache.simulator.admission.tinycache;
 
 import java.util.Random;
 
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import com.google.errorprone.annotations.Var;
+
 /**
- * This is the TinyCache model that takes advantage of random eviction policy with
- * a ghost cache as admission policy. It offers a very dense memory layout combined with
- * (relative) speed at the expense of limited associativity. s
+ * This is the TinyCache model that takes advantage of random eviction policy with a ghost cache as
+ * admission policy. It offers a very dense memory layout combined with (relative) speed at the
+ * expense of limited associativity. s
  *
  * @author gilga1983@gmail.com (Gil Einziger)
  */
-@SuppressWarnings("PMD.AvoidDollarSigns")
 public final class TinyCacheWithGhostCache {
-  public final long[] chainIndex;
-  public final long[] isLastIndex;
+  private static final int sampleSize = 10;
+
   private final HashFunctionParser hashFunc;
+  private final TinyCacheSketch ghostCache;
+  private final TinySetIndexing indexing;
+  private final long[] chainIndex;
+  private final long[] lastIndex;
   private final int itemsPerSet;
   private final long[] cache;
   private final Random rnd;
-  private final int sampleSize;
-  private final TinyCacheSketch ghostCache;
 
   public TinyCacheWithGhostCache(int nrSets, int itemsPerSet, int randomSeed) {
-    chainIndex = new long[nrSets];
-    isLastIndex = new long[nrSets];
-    hashFunc = new HashFunctionParser(nrSets);
+    this.ghostCache = new TinyCacheSketch(nrSets * sampleSize, itemsPerSet, randomSeed + 1);
+    this.hashFunc = new HashFunctionParser(nrSets);
+    this.cache = new long[nrSets * itemsPerSet];
+    this.indexing = new TinySetIndexing();
+    this.chainIndex = new long[nrSets];
+    this.lastIndex = new long[nrSets];
+    this.rnd = new Random(randomSeed);
     this.itemsPerSet = itemsPerSet;
-    cache = new long[nrSets * itemsPerSet];
-    sampleSize = 10;
-    ghostCache = new TinyCacheSketch(nrSets * sampleSize, itemsPerSet, randomSeed + 1);
-    rnd = new Random(randomSeed);
   }
 
   public boolean contains(long item) {
     hashFunc.createHash(item);
-    if (!TinySetIndexing.chainExist(chainIndex[hashFunc.fpaux.set], hashFunc.fpaux.chainId)) {
+    if (!indexing.chainExist(chainIndex[hashFunc.fpaux.set], hashFunc.fpaux.chainId)) {
       return false;
     }
-    TinySetIndexing.getChain(hashFunc.fpaux, chainIndex, isLastIndex);
-    int offset = this.itemsPerSet * hashFunc.fpaux.set;
-    TinySetIndexing.chainStart += offset;
-    TinySetIndexing.chainEnd += offset;
+    indexing.getChain(hashFunc.fpaux, chainIndex, lastIndex);
+    int offset = itemsPerSet * hashFunc.fpaux.set;
+    indexing.setChainStart(indexing.getChainStart() + offset);
+    indexing.setChainEnd(indexing.getChainEnd() + offset);
 
     // Gil : I think some of these tests are, I till carefully examine this function when I have
     // time. As far as I understand it is working right now.
-    while (TinySetIndexing.chainStart <= TinySetIndexing.chainEnd) {
+    while (indexing.getChainStart() <= indexing.getChainEnd()) {
       try {
-        if (cache[TinySetIndexing.chainStart % cache.length] == hashFunc.fpaux.value) {
+        if (cache[indexing.getChainStart() % cache.length] == hashFunc.fpaux.value) {
           return true;
         }
-        TinySetIndexing.chainStart++;
-      } catch (Exception e) {
-        System.out.println(" length: " + cache.length + " Access: " + TinySetIndexing.chainStart);
+        indexing.setChainStart(indexing.getChainStart() + 1);
+      } catch (RuntimeException e) {
+        System.out.println("length: " + cache.length + " Access: " + indexing.getChainStart());
       }
     }
     return false;
   }
 
   /**
-   * Implementing add and remove together in one function, means that less items are shifted.
-   * (reduction of 3 times from trivial implementation).
-   *
-   * @param fpaux
-   * @param victim
-   * @param bucketStart
-   * @return
+   * Implementing add and remove together in one function means that fewer items are shifted
+   * (reduction of 3 times from the trivial implementation).
    */
+  @CanIgnoreReturnValue
   private int replace(HashedItem fpaux, byte victim, int bucketStart, int removedOffset) {
     byte chainId = fpaux.chainId;
     fpaux.chainId = victim;
-    this.cache[bucketStart + removedOffset] = 0;
-    TinySetIndexing.removeItem(fpaux, chainIndex, isLastIndex);
+    cache[bucketStart + removedOffset] = 0;
+    indexing.removeItem(fpaux, chainIndex, lastIndex);
     fpaux.chainId = chainId;
-    int idxToAdd = TinySetIndexing.addItem(fpaux, chainIndex, isLastIndex);
+    int idxToAdd = indexing.addItem(fpaux, chainIndex, lastIndex);
     int delta = (removedOffset < idxToAdd) ? -1 : 1;
     replaceItems(idxToAdd, fpaux.value, bucketStart, delta);
     return removedOffset;
   }
 
   public void recordItem(long item) {
-    if (this.ghostCache.countItem(hashFunc.fpaux.value) < sampleSize) {
-      this.ghostCache.addItem(hashFunc.fpaux.value);
+    if (ghostCache.countItem(hashFunc.fpaux.value) < sampleSize) {
+      ghostCache.addItem(hashFunc.fpaux.value);
     }
   }
 
   public boolean addItem(long item) {
     hashFunc.createHash(item);
-    int bucketStart = this.itemsPerSet * hashFunc.fpaux.set;
-    if (cache[bucketStart + this.itemsPerSet - 1] != 0) {
+    int bucketStart = itemsPerSet * hashFunc.fpaux.set;
+    if (cache[bucketStart + itemsPerSet - 1] != 0) {
       return selectVictim(bucketStart);
     }
-    int idxToAdd = TinySetIndexing.addItem(hashFunc.fpaux, chainIndex, isLastIndex);
-    this.replaceItems(idxToAdd, hashFunc.fpaux.value, bucketStart, 1);
+    int idxToAdd = indexing.addItem(hashFunc.fpaux, chainIndex, lastIndex);
+    replaceItems(idxToAdd, hashFunc.fpaux.value, bucketStart, 1);
     return false;
   }
 
+  @SuppressWarnings("Varifier")
   private boolean selectVictim(int bucketStart) {
-    byte victimOffset = (byte) rnd.nextInt(this.itemsPerSet);
-    int victimChain = TinySetIndexing.getChainAtOffset(
-        hashFunc.fpaux, chainIndex, isLastIndex, victimOffset);
+    byte victimOffset = (byte) rnd.nextInt(itemsPerSet);
+    int victimChain = indexing.getChainAtOffset(
+        hashFunc.fpaux, chainIndex, lastIndex, victimOffset);
     long victim = cache[bucketStart + victimOffset];
     // this if is still for debugging and common sense. Should be eliminated for performance once
     // I am sure of the correctness.
-    if (TinySetIndexing.chainExist(chainIndex[hashFunc.fpaux.set], victimChain)) {
-      int victimScore = this.ghostCache.countItem(victim);
-      int currItemScore = this.ghostCache.countItem(hashFunc.fpaux.value);
+    if (indexing.chainExist(chainIndex[hashFunc.fpaux.set], victimChain)) {
+      int victimScore = ghostCache.countItem(victim);
+      int currItemScore = ghostCache.countItem(hashFunc.fpaux.value);
       if (currItemScore > victimScore) {
         replace(hashFunc.fpaux, (byte) victimChain, bucketStart, victimOffset);
         return true;
-      } else {
-        return false;
       }
-    } else {
-      throw new RuntimeException("Failed to replace");
+      return false;
     }
+    throw new IllegalStateException("Failed to replace");
   }
 
-  private void replaceItems(final int idx, long value, int start, final int delta) {
+  @SuppressWarnings("PMD.LocalVariableNamingConventions")
+  private void replaceItems(int idx, @Var long value, @Var int start, int delta) {
+    @Var long entry;
     start += idx;
-    long $;
     do {
-      $ = this.cache[start];
-      this.cache[start] = value;
-      value = $;
+      entry = cache[start];
+      cache[start] = value;
+      value = entry;
       start += delta;
     } while (value != 0);
   }

@@ -15,9 +15,8 @@
  */
 package com.github.benmanes.caffeine.cache;
 
-import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
-import javax.annotation.concurrent.ThreadSafe;
+import org.jspecify.annotations.NullMarked;
+import org.jspecify.annotations.Nullable;
 
 /**
  * An object that can receive a notification when an entry is removed from a cache. The removal
@@ -34,7 +33,7 @@ import javax.annotation.concurrent.ThreadSafe;
  * @param <V> the most general type of values this listener can listen for; for example
  *        {@code Object} if any value is acceptable
  */
-@ThreadSafe
+@NullMarked
 @FunctionalInterface
 public interface RemovalListener<K, V> {
 
@@ -44,9 +43,9 @@ public interface RemovalListener<K, V> {
    * This does not always signify that the key is now absent from the cache, as it may have already
    * been re-added.
    *
-   * @param key the key represented by this entry
-   * @param value the value represented by this entry
+   * @param key the key represented by this entry, or {@code null} if collected
+   * @param value the value represented by this entry, or {@code null} if collected
    * @param cause the reason for which the entry was removed
    */
-  void onRemoval(@Nullable K key, @Nullable V value, @Nonnull RemovalCause cause);
+  void onRemoval(@Nullable K key, @Nullable V value, RemovalCause cause);
 }

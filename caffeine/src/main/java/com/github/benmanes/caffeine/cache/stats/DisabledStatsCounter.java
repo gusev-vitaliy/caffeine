@@ -15,6 +15,10 @@
  */
 package com.github.benmanes.caffeine.cache.stats;
 
+import static java.util.Objects.requireNonNull;
+
+import com.github.benmanes.caffeine.cache.RemovalCause;
+
 /**
  * A {@link StatsCounter} implementation that does not record any cache events.
  *
@@ -22,8 +26,6 @@ package com.github.benmanes.caffeine.cache.stats;
  */
 enum DisabledStatsCounter implements StatsCounter {
   INSTANCE;
-
-  static final CacheStats EMPTY_STATS = new CacheStats(0, 0, 0, 0, 0, 0);
 
   @Override
   public void recordHits(int count) {}
@@ -38,11 +40,13 @@ enum DisabledStatsCounter implements StatsCounter {
   public void recordLoadFailure(long loadTime) {}
 
   @Override
-  public void recordEviction() {}
+  public void recordEviction(int weight, RemovalCause cause) {
+    requireNonNull(cause);
+  }
 
   @Override
   public CacheStats snapshot() {
-    return EMPTY_STATS;
+    return CacheStats.empty();
   }
 
   @Override

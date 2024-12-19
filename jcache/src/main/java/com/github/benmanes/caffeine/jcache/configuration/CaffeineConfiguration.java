@@ -15,10 +15,16 @@
  */
 package com.github.benmanes.caffeine.jcache.configuration;
 
-import java.util.Objects;
-import java.util.OptionalLong;
+import static java.util.Objects.requireNonNull;
 
-import javax.annotation.Nullable;
+import java.util.Iterator;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Spliterator;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
+
 import javax.cache.configuration.CacheEntryListenerConfiguration;
 import javax.cache.configuration.CompleteConfiguration;
 import javax.cache.configuration.Factory;
@@ -27,40 +33,101 @@ import javax.cache.expiry.ExpiryPolicy;
 import javax.cache.integration.CacheLoader;
 import javax.cache.integration.CacheWriter;
 
+import org.jspecify.annotations.NullMarked;
+import org.jspecify.annotations.Nullable;
+
+import com.github.benmanes.caffeine.cache.Expiry;
+import com.github.benmanes.caffeine.cache.Scheduler;
+import com.github.benmanes.caffeine.cache.Ticker;
 import com.github.benmanes.caffeine.cache.Weigher;
 import com.github.benmanes.caffeine.jcache.copy.Copier;
+import com.github.benmanes.caffeine.jcache.copy.JavaSerializationCopier;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 
 /**
  * A JCache configuration with Caffeine specific settings.
+ * <p>
+ * The initial settings disable <code>store by value</code> so that entries are not copied when
+ * crossing the {@link javax.cache.Cache} API boundary. If enabled and the {@link Copier} is not
+ * explicitly set, then the {@link JavaSerializationCopier} will be used. This differs from
+ * {@link MutableConfiguration} which enables <code>store by value</code> at construction.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@NullMarked
 public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<K, V> {
+  private static final Factory<Scheduler> DISABLED_SCHEDULER = Scheduler::disabledScheduler;
+  private static final Factory<Copier> JAVA_COPIER = JavaSerializationCopier::new;
+  private static final Factory<Executor> COMMON_POOL = ForkJoinPool::commonPool;
+  private static final Factory<Ticker> SYSTEM_TICKER = Ticker::systemTicker;
   private static final long serialVersionUID = 1L;
 
   private final MutableConfiguration<K, V> delegate;
+  private final boolean readOnly;
 
-  private Factory<Weigher<K, V>> weigherFactory;
+  private @Nullable Factory<Weigher<K, V>> weigherFactory;
+  private @Nullable Factory<Expiry<K, V>> expiryFactory;
+
+  private Factory<Scheduler> schedulerFactory;
+  private Factory<Executor> executorFactory;
   private Factory<Copier> copierFactory;
-  private Long expireAfterAccessNanos;
-  private Long expireAfterWriteNanos;
-  private Long maximumWeight;
-  private Long maximumSize;
+  private Factory<Ticker> tickerFactory;
+
+  private @Nullable Long refreshAfterWriteNanos;
+  private @Nullable Long expireAfterAccessNanos;
+  private @Nullable Long expireAfterWriteNanos;
+  private @Nullable Long maximumWeight;
+  private @Nullable Long maximumSize;
+  private boolean nativeStatistics;
 
   public CaffeineConfiguration() {
     delegate = new MutableConfiguration<>();
+    delegate.setStoreByValue(false);
+    schedulerFactory = DISABLED_SCHEDULER;
+    tickerFactory = SYSTEM_TICKER;
+    executorFactory = COMMON_POOL;
+    copierFactory = JAVA_COPIER;
+    readOnly = false;
   }
 
+  /** Returns a modifiable copy of the configuration. */
   public CaffeineConfiguration(CompleteConfiguration<K, V> configuration) {
+    this(configuration, /* readOnly= */ false);
+  }
+
+  private CaffeineConfiguration(CompleteConfiguration<K, V> configuration, boolean readOnly) {
     delegate = new MutableConfiguration<>(configuration);
     if (configuration instanceof CaffeineConfiguration<?, ?>) {
-      CaffeineConfiguration<K, V> config = (CaffeineConfiguration<K, V>) configuration;
+      var config = (CaffeineConfiguration<K, V>) configuration;
+      refreshAfterWriteNanos = config.refreshAfterWriteNanos;
       expireAfterAccessNanos = config.expireAfterAccessNanos;
       expireAfterWriteNanos = config.expireAfterWriteNanos;
+      nativeStatistics = config.nativeStatistics;
+      schedulerFactory = config.schedulerFactory;
+      executorFactory = config.executorFactory;
+      expiryFactory = config.expiryFactory;
       copierFactory = config.copierFactory;
+      tickerFactory = config.tickerFactory;
       weigherFactory = config.weigherFactory;
       maximumWeight = config.maximumWeight;
       maximumSize = config.maximumSize;
+    } else {
+      schedulerFactory = DISABLED_SCHEDULER;
+      tickerFactory = SYSTEM_TICKER;
+      executorFactory = COMMON_POOL;
+      copierFactory = JAVA_COPIER;
+    }
+    this.readOnly = readOnly;
+  }
+
+  /** Returns an unmodifiable copy of this configuration. */
+  public CaffeineConfiguration<K, V> immutableCopy() {
+    return new CaffeineConfiguration<>(this, /* readOnly= */ true);
+  }
+
+  private void checkIfReadOnly() {
+    if (readOnly) {
+      throw new UnsupportedOperationException();
     }
   }
 
@@ -75,60 +142,83 @@ public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<
   }
 
   /** See {@link MutableConfiguration#setTypes}. */
-  public void setTypes(Class<K> keyType, Class<V> valueType) {
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setTypes(Class<K> keyType, Class<V> valueType) {
+    checkIfReadOnly();
     delegate.setTypes(keyType, valueType);
+    return this;
   }
 
   @Override
   public Iterable<CacheEntryListenerConfiguration<K, V>> getCacheEntryListenerConfigurations() {
-    return delegate.getCacheEntryListenerConfigurations();
+    return new UnmodifiableIterable<>(delegate.getCacheEntryListenerConfigurations());
   }
 
   /** See {@link MutableConfiguration#addCacheEntryListenerConfiguration}. */
-  public void addCacheEntryListenerConfiguration(
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> addCacheEntryListenerConfiguration(
       CacheEntryListenerConfiguration<K, V> cacheEntryListenerConfiguration) {
+    checkIfReadOnly();
     delegate.addCacheEntryListenerConfiguration(cacheEntryListenerConfiguration);
+    return this;
   }
 
   /** See {@link MutableConfiguration#removeCacheEntryListenerConfiguration}. */
-  public void removeCacheEntryListenerConfiguration(
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> removeCacheEntryListenerConfiguration(
       CacheEntryListenerConfiguration<K, V> cacheEntryListenerConfiguration) {
+    checkIfReadOnly();
     delegate.removeCacheEntryListenerConfiguration(cacheEntryListenerConfiguration);
+    return this;
   }
 
   @Override
-  public Factory<CacheLoader<K, V>> getCacheLoaderFactory() {
+  public @Nullable Factory<CacheLoader<K, V>> getCacheLoaderFactory() {
     return delegate.getCacheLoaderFactory();
   }
 
   /** See {@link MutableConfiguration#setCacheLoaderFactory}. */
-  public void setCacheLoaderFactory(Factory<? extends CacheLoader<K, V>> factory) {
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setCacheLoaderFactory(
+      @Nullable Factory<? extends CacheLoader<K, V>> factory) {
+    checkIfReadOnly();
     delegate.setCacheLoaderFactory(factory);
+    return this;
   }
 
   @Override
-  public Factory<CacheWriter<? super K, ? super V>> getCacheWriterFactory() {
+  public @Nullable Factory<CacheWriter<? super K, ? super V>> getCacheWriterFactory() {
     return delegate.getCacheWriterFactory();
   }
 
-  /** @return a writer created by the configured factory or null if not set. */
+  /** Returns a writer created by the configured factory or null if not set. */
   public @Nullable CacheWriter<K , V> getCacheWriter() {
-    if (hasCacheWriter()) {
+    var factory = delegate.getCacheWriterFactory();
+    if (factory != null) {
       @SuppressWarnings("unchecked")
-      CacheWriter<K , V> writer = (CacheWriter<K, V>) getCacheWriterFactory().create();
+      var writer = (CacheWriter<K, V>) factory.create();
       return writer;
     }
     return null;
   }
 
-  /** @return if the cache writer factory is specified. */
+  /** Returns if the cache writer factory is specified. */
   public boolean hasCacheWriter() {
     return getCacheWriterFactory() != null;
   }
 
   /** See {@link MutableConfiguration#setCacheWriterFactory}. */
-  public void setCacheWriterFactory(Factory<? extends CacheWriter<? super K, ? super V>> factory) {
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setCacheWriterFactory(
+      @Nullable Factory<? extends CacheWriter<? super K, ? super V>> factory) {
+    checkIfReadOnly();
     delegate.setCacheWriterFactory(factory);
+    return this;
   }
 
   @Override
@@ -137,8 +227,13 @@ public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<
   }
 
   /** See {@link MutableConfiguration#setExpiryPolicyFactory}. */
-  public void setExpiryPolicyFactory(Factory<? extends ExpiryPolicy> factory) {
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setExpiryPolicyFactory(
+      @Nullable Factory<? extends ExpiryPolicy> factory) {
+    checkIfReadOnly();
     delegate.setExpiryPolicyFactory(factory);
+    return this;
   }
 
   @Override
@@ -147,8 +242,12 @@ public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<
   }
 
   /** See {@link MutableConfiguration#setReadThrough}. */
-  public void setReadThrough(boolean isReadThrough) {
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setReadThrough(boolean isReadThrough) {
+    checkIfReadOnly();
     delegate.setReadThrough(isReadThrough);
+    return this;
   }
 
   @Override
@@ -157,8 +256,12 @@ public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<
   }
 
   /** See {@link MutableConfiguration#setWriteThrough}. */
-  public void setWriteThrough(boolean isWriteThrough) {
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setWriteThrough(boolean isWriteThrough) {
+    checkIfReadOnly();
     delegate.setWriteThrough(isWriteThrough);
+    return this;
   }
 
   @Override
@@ -167,8 +270,37 @@ public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<
   }
 
   /** See {@link MutableConfiguration#setStoreByValue}. */
-  public void setStoreByValue(boolean isStoreByValue) {
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setStoreByValue(boolean isStoreByValue) {
+    checkIfReadOnly();
     delegate.setStoreByValue(isStoreByValue);
+    return this;
+  }
+
+  /**
+   * Checks whether native statistics collection is enabled in this cache.
+   * <p>
+   * The default value is <code>false</code>.
+   *
+   * @return true if native statistics collection is enabled
+   */
+  public boolean isNativeStatisticsEnabled() {
+    return nativeStatistics;
+  }
+
+  /**
+   * Sets whether native statistics gathering is enabled on a cache.
+   *
+   * @param enabled true to enable native statistics, false to disable.
+   * @return the {@link CaffeineConfiguration} to permit fluent-style method calls
+   */
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setNativeStatisticsEnabled(boolean enabled) {
+    checkIfReadOnly();
+    this.nativeStatistics = enabled;
+    return this;
   }
 
   @Override
@@ -177,19 +309,27 @@ public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<
   }
 
   /** See {@link MutableConfiguration#setStatisticsEnabled}. */
-  public void setStatisticsEnabled(boolean enabled) {
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setStatisticsEnabled(boolean enabled) {
+    checkIfReadOnly();
     delegate.setStatisticsEnabled(enabled);
+    return this;
   }
 
-  /** See {@link MutableConfiguration#isManagementEnabled}. */
+  /** See {@link CompleteConfiguration#isManagementEnabled}. */
   @Override
   public boolean isManagementEnabled() {
     return delegate.isManagementEnabled();
   }
 
   /** See {@link MutableConfiguration#setManagementEnabled}. */
-  public void setManagementEnabled(boolean enabled) {
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setManagementEnabled(boolean enabled) {
+    checkIfReadOnly();
     delegate.setManagementEnabled(enabled);
+    return this;
   }
 
   /**
@@ -205,20 +345,110 @@ public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<
    * Set the {@link Factory} for the {@link Copier}.
    *
    * @param factory the {@link Copier} {@link Factory}
+   * @return the {@link CaffeineConfiguration} to permit fluent-style method calls
    */
-  public void setCopierFactory(Factory<Copier> factory) {
-    copierFactory = factory;
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setCopierFactory(Factory<Copier> factory) {
+    checkIfReadOnly();
+    copierFactory = requireNonNull(factory);
+    return this;
   }
 
   /**
-   * Set the expire after write in nanoseconds.
+   * Returns the {@link Factory} for the {@link Scheduler} to be used for the cache.
    *
-   * @param expireAfterWriteNanos the duration in nanoseconds
+   * @return the {@link Factory} for the {@link Scheduler}
    */
-  public void setExpireAfterWrite(OptionalLong expireAfterWriteNanos) {
-    this.expireAfterWriteNanos = expireAfterWriteNanos.isPresent()
-        ? expireAfterWriteNanos.getAsLong()
+  public Factory<Scheduler> getSchedulerFactory() {
+    return schedulerFactory;
+  }
+
+  /**
+   * Set the {@link Factory} for the {@link Scheduler}.
+   *
+   * @param factory the {@link Scheduler} {@link Factory}
+   * @return the {@link CaffeineConfiguration} to permit fluent-style method calls
+   */
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setSchedulerFactory(Factory<Scheduler> factory) {
+    checkIfReadOnly();
+    schedulerFactory = requireNonNull(factory);
+    return this;
+  }
+
+  /**
+   * Returns the {@link Factory} for the {@link Ticker} to be used for the cache.
+   *
+   * @return the {@link Factory} for the {@link Ticker}
+   */
+  public Factory<Ticker> getTickerFactory() {
+    return tickerFactory;
+  }
+
+  /**
+   * Set the {@link Factory} for the {@link Ticker}.
+   *
+   * @param factory the {@link Ticker} {@link Factory}
+   * @return the {@link CaffeineConfiguration} to permit fluent-style method calls
+   */
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setTickerFactory(Factory<Ticker> factory) {
+    checkIfReadOnly();
+    tickerFactory = requireNonNull(factory);
+    return this;
+  }
+
+  /**
+   * Returns the {@link Factory} for the {@link Executor} to be used for the cache.
+   *
+   * @return the {@link Factory} for the {@link Executor}
+   */
+  public Factory<Executor> getExecutorFactory() {
+    return executorFactory;
+  }
+
+  /**
+   * Set the {@link Factory} for the {@link Executor}.
+   *
+   * @param factory the {@link Executor} {@link Factory}
+   * @return the {@link CaffeineConfiguration} to permit fluent-style method calls
+   */
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setExecutorFactory(Factory<Executor> factory) {
+    checkIfReadOnly();
+    executorFactory = requireNonNull(factory);
+    return this;
+  }
+
+  /**
+   * Returns the refresh after write in nanoseconds.
+   *
+   * @return the duration in nanoseconds
+   */
+  public OptionalLong getRefreshAfterWrite() {
+    return (refreshAfterWriteNanos == null)
+        ? OptionalLong.empty()
+        : OptionalLong.of(refreshAfterWriteNanos);
+  }
+
+  /**
+   * Set the refresh after write in nanoseconds.
+   *
+   * @param refreshAfterWriteNanos the duration in nanoseconds
+   * @return the {@link CaffeineConfiguration} to permit fluent-style method calls
+   */
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setRefreshAfterWrite(OptionalLong refreshAfterWriteNanos) {
+    checkIfReadOnly();
+    this.refreshAfterWriteNanos = refreshAfterWriteNanos.isPresent()
+        ? refreshAfterWriteNanos.getAsLong()
         : null;
+    return this;
   }
 
   /**
@@ -235,12 +465,17 @@ public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<
   /**
    * Set the expire after write in nanoseconds.
    *
-   * @param expireAfterAccessNanos the duration in nanoseconds
+   * @param expireAfterWriteNanos the duration in nanoseconds
+   * @return the {@link CaffeineConfiguration} to permit fluent-style method calls
    */
-  public void setExpireAfterAccess(OptionalLong expireAfterAccessNanos) {
-    this.expireAfterAccessNanos = expireAfterAccessNanos.isPresent()
-        ? expireAfterAccessNanos.getAsLong()
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setExpireAfterWrite(OptionalLong expireAfterWriteNanos) {
+    checkIfReadOnly();
+    this.expireAfterWriteNanos = expireAfterWriteNanos.isPresent()
+        ? expireAfterWriteNanos.getAsLong()
         : null;
+    return this;
   }
 
   /**
@@ -255,18 +490,47 @@ public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<
   }
 
   /**
-   * Set the maximum weight.
+   * Set the expire after write in nanoseconds.
    *
-   * @param maximumSize the maximum size
+   * @param expireAfterAccessNanos the duration in nanoseconds
+   * @return the {@link CaffeineConfiguration} to permit fluent-style method calls
    */
-  public void setMaximumSize(OptionalLong maximumSize) {
-    this.maximumSize = maximumSize.isPresent()
-        ? maximumSize.getAsLong()
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setExpireAfterAccess(OptionalLong expireAfterAccessNanos) {
+    checkIfReadOnly();
+    this.expireAfterAccessNanos = expireAfterAccessNanos.isPresent()
+        ? expireAfterAccessNanos.getAsLong()
         : null;
+    return this;
   }
 
   /**
-   * Returns the maximum weight to be used for the cache.
+   * Returns the {@link Factory} for the {@link Expiry} to be used for the cache.
+   *
+   * @return the {@link Factory} for the {@link Expiry}
+   */
+  public Optional<Factory<Expiry<K, V>>> getExpiryFactory() {
+    return Optional.ofNullable(expiryFactory);
+  }
+
+  /**
+   * Set the {@link Factory} for the {@link Expiry}.
+   *
+   * @param factory the {@link Expiry} {@link Factory}
+   * @return the {@link CaffeineConfiguration} to permit fluent-style method calls
+   */
+  @CanIgnoreReturnValue
+  @SuppressWarnings({"PMD.LinguisticNaming", "unchecked"})
+  public CaffeineConfiguration<K, V> setExpiryFactory(
+      Optional<Factory<? extends Expiry<K, V>>> factory) {
+    checkIfReadOnly();
+    expiryFactory = (Factory<Expiry<K, V>>) factory.orElse(null);
+    return this;
+  }
+
+  /**
+   * Returns the maximum size to be used for the cache.
    *
    * @return the maximum size
    */
@@ -277,14 +541,19 @@ public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<
   }
 
   /**
-   * Set the maximum weight.
+   * Set the maximum size.
    *
-   * @param maximumWeight the maximum weighted size
+   * @param maximumSize the maximum size
+   * @return the {@link CaffeineConfiguration} to permit fluent-style method calls
    */
-  public void setMaximumWeight(OptionalLong maximumWeight) {
-    this.maximumWeight = maximumWeight.isPresent()
-        ? maximumWeight.getAsLong()
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setMaximumSize(OptionalLong maximumSize) {
+    checkIfReadOnly();
+    this.maximumSize = maximumSize.isPresent()
+        ? maximumSize.getAsLong()
         : null;
+    return this;
   }
 
   /**
@@ -299,34 +568,59 @@ public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<
   }
 
   /**
+   * Set the maximum weight.
+   *
+   * @param maximumWeight the maximum weighted size
+   * @return the {@link CaffeineConfiguration} to permit fluent-style method calls
+   */
+  @CanIgnoreReturnValue
+  @SuppressWarnings("PMD.LinguisticNaming")
+  public CaffeineConfiguration<K, V> setMaximumWeight(OptionalLong maximumWeight) {
+    checkIfReadOnly();
+    this.maximumWeight = maximumWeight.isPresent()
+        ? maximumWeight.getAsLong()
+        : null;
+    return this;
+  }
+
+  /**
    * Returns the {@link Factory} for the {@link Weigher} to be used for the cache.
    *
    * @return the {@link Factory} for the {@link Weigher}
    */
-  public Factory<Weigher<K, V>> getWeigherFactory() {
-    return weigherFactory;
+  public Optional<Factory<Weigher<K, V>>> getWeigherFactory() {
+    return Optional.ofNullable(weigherFactory);
   }
 
   /**
-   * Set the {@link Factory} for the {@link Copier}.
+   * Set the {@link Factory} for the {@link Weigher}.
    *
-   * @param factory the {@link Copier} {@link Factory}
+   * @param factory the {@link Weigher} {@link Factory}
+   * @return the {@link CaffeineConfiguration} to permit fluent-style method calls
    */
-  public void setWeigherFactory(Factory<Weigher<K, V>> factory) {
-    weigherFactory = factory;
+  @CanIgnoreReturnValue
+  @SuppressWarnings({"PMD.LinguisticNaming", "unchecked"})
+  public CaffeineConfiguration<K, V> setWeigherFactory(
+      Optional<Factory<? extends Weigher<K, V>>> factory) {
+    checkIfReadOnly();
+    weigherFactory = (Factory<Weigher<K, V>>) factory.orElse(null);
+    return this;
   }
 
   @Override
-  public boolean equals(Object o) {
+  public boolean equals(@Nullable Object o) {
     if (o == this) {
       return true;
     } else if (!(o instanceof CaffeineConfiguration<?, ?>)) {
       return false;
     }
-    CaffeineConfiguration<?, ?> config = (CaffeineConfiguration<?, ?>) o;
-    return Objects.equals(expireAfterAccessNanos, config.expireAfterAccessNanos)
+    var config = (CaffeineConfiguration<?, ?>) o;
+    return Objects.equals(refreshAfterWriteNanos, config.refreshAfterWriteNanos)
+        && Objects.equals(expireAfterAccessNanos, config.expireAfterAccessNanos)
         && Objects.equals(expireAfterWriteNanos, config.expireAfterWriteNanos)
+        && Objects.equals(executorFactory, config.executorFactory)
         && Objects.equals(copierFactory, config.copierFactory)
+        && Objects.equals(tickerFactory, config.tickerFactory)
         && Objects.equals(weigherFactory, config.weigherFactory)
         && Objects.equals(maximumWeight, config.maximumWeight)
         && Objects.equals(maximumSize, config.maximumSize)
@@ -336,5 +630,30 @@ public final class CaffeineConfiguration<K, V> implements CompleteConfiguration<
   @Override
   public int hashCode() {
     return delegate.hashCode();
+  }
+
+  private static final class UnmodifiableIterable<E> implements Iterable<E> {
+    private final Iterable<E> delegate;
+
+    private UnmodifiableIterable(Iterable<E> delegate) {
+      this.delegate = delegate;
+    }
+    @Override public Iterator<E> iterator() {
+      var iterator = delegate.iterator();
+      return new Iterator<>() {
+        @Override public boolean hasNext() {
+          return iterator.hasNext();
+        }
+        @Override public E next() {
+          return iterator.next();
+        }
+      };
+    }
+    @Override public Spliterator<E> spliterator() {
+      return delegate.spliterator();
+    }
+    @Override public String toString() {
+      return delegate.toString();
+    }
   }
 }

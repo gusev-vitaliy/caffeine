@@ -15,19 +15,20 @@
  */
 package com.github.benmanes.caffeine.cache.stats;
 
-import javax.annotation.Nonnegative;
-import javax.annotation.Nonnull;
-import javax.annotation.concurrent.ThreadSafe;
+import java.util.Map;
+
+import org.jspecify.annotations.NullMarked;
 
 import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.RemovalCause;
 
 /**
  * Accumulates statistics during the operation of a {@link Cache} for presentation by
- * {@link Cache#stats}. This is solely intended for consumption by {@code Cache} implementors.
+ * {@link Cache#stats}.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-@ThreadSafe
+@NullMarked
 public interface StatsCounter {
 
   /**
@@ -35,7 +36,7 @@ public interface StatsCounter {
    *
    * @param count the number of hits to record
    */
-  void recordHits(@Nonnegative int count);
+  void recordHits(int count);
 
   /**
    * Records cache misses. This should be called when a cache request returns a value that was not
@@ -47,42 +48,49 @@ public interface StatsCounter {
    *
    * @param count the number of misses to record
    */
-  void recordMisses(@Nonnegative int count);
+  void recordMisses(int count);
 
   /**
-   * Records the successful load of a new entry. This should be called when a cache request causes
-   * an entry to be loaded, and the loading completes successfully. In contrast to
-   * {@link #recordMisses}, this method should only be called by the loading thread.
+   * Records the successful load of a new entry. This method should be called when a cache request
+   * causes an entry to be loaded (such as by {@link Cache#get} or {@link Map#computeIfAbsent}) and
+   * the loading completes successfully. In contrast to {@link #recordMisses}, this method should
+   * only be called by the loading thread.
    *
    * @param loadTime the number of nanoseconds the cache spent computing or retrieving the new value
    */
-  void recordLoadSuccess(@Nonnegative long loadTime);
+  void recordLoadSuccess(long loadTime);
 
   /**
-   * Records the failed load of a new entry. This should be called when a cache request causes an
-   * entry to be loaded, but either no value is found or an exception is thrown while loading the
-   * entry. In contrast to {@link #recordMisses}, this method should only be called by the loading
-   * thread.
+   * Records the failed load of a new entry. This method should be called when a cache request
+   * causes an entry to be loaded (such as by {@link Cache#get} or {@link Map#computeIfAbsent}), but
+   * an exception is thrown while loading the entry or the loading function returns null. In
+   * contrast to {@link #recordMisses}, this method should only be called by the loading thread.
    *
    * @param loadTime the number of nanoseconds the cache spent computing or retrieving the new value
    *        prior to discovering the value doesn't exist or an exception being thrown
    */
-  void recordLoadFailure(@Nonnegative long loadTime);
+  void recordLoadFailure(long loadTime);
 
   /**
    * Records the eviction of an entry from the cache. This should only been called when an entry is
    * evicted due to the cache's eviction strategy, and not as a result of manual
    * {@link Cache#invalidate invalidations}.
+   *
+   * @param weight the weight of the evicted entry
+   * @param cause the reason for which the entry was removed
    */
-  void recordEviction();
+  void recordEviction(int weight, RemovalCause cause);
 
   /**
    * Returns a snapshot of this counter's values. Note that this may be an inconsistent view, as it
    * may be interleaved with update operations.
+   * <p>
+   * <b>Note:</b> the values of the metrics are undefined in case of overflow (though it is
+   * guaranteed not to throw an exception). If you require specific handling, we recommend
+   * implementing your own stats collector.
    *
    * @return a snapshot of this counter's values
    */
-  @Nonnull
   CacheStats snapshot();
 
   /**
@@ -90,17 +98,20 @@ public interface StatsCounter {
    *
    * @return an accumulator that does not record metrics
    */
-  static @Nonnull StatsCounter disabledStatsCounter() {
+  static StatsCounter disabledStatsCounter() {
     return DisabledStatsCounter.INSTANCE;
   }
 
   /**
    * Returns an accumulator that suppresses and logs any exception thrown by the delegate
-   * <tt>statsCounter</tt>.
+   * {@code statsCounter}.
    *
+   * @param statsCounter the accumulator to delegate to
    * @return an accumulator that suppresses and logs any exception thrown by the delegate
    */
-  static @Nonnull StatsCounter guardedStatsCounter(@Nonnull StatsCounter statsCounter) {
-    return new GuardedStatsCounter(statsCounter);
+  static StatsCounter guardedStatsCounter(StatsCounter statsCounter) {
+    return (statsCounter instanceof GuardedStatsCounter)
+        ? statsCounter
+        : new GuardedStatsCounter(statsCounter);
   }
 }

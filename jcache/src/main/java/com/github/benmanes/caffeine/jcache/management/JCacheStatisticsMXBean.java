@@ -18,7 +18,6 @@ package com.github.benmanes.caffeine.jcache.management;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 
-import javax.annotation.Nonnegative;
 import javax.cache.management.CacheStatisticsMXBean;
 
 /**
@@ -26,12 +25,12 @@ import javax.cache.management.CacheStatisticsMXBean;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@SuppressWarnings("MemberName")
 public final class JCacheStatisticsMXBean implements CacheStatisticsMXBean {
-  private final LongAdder removals = new LongAdder();
-  private final LongAdder expiries = new LongAdder();
   private final LongAdder puts = new LongAdder();
   private final LongAdder hits = new LongAdder();
   private final LongAdder misses = new LongAdder();
+  private final LongAdder removals = new LongAdder();
   private final LongAdder evictions = new LongAdder();
   private final LongAdder putTimeNanos = new LongAdder();
   private final LongAdder getTimeNanos = new LongAdder();
@@ -39,7 +38,7 @@ public final class JCacheStatisticsMXBean implements CacheStatisticsMXBean {
 
   private volatile boolean enabled;
 
-  /** @return if statistic collection is enabled. */
+  /** Returns if statistic collection is enabled. */
   public boolean isEnabled() {
     return enabled;
   }
@@ -58,7 +57,6 @@ public final class JCacheStatisticsMXBean implements CacheStatisticsMXBean {
     puts.reset();
     misses.reset();
     removals.reset();
-    expiries.reset();
     hits.reset();
     evictions.reset();
     getTimeNanos.reset();
@@ -82,7 +80,7 @@ public final class JCacheStatisticsMXBean implements CacheStatisticsMXBean {
    *
    * @param count the number of hits to record
    */
-  public void recordHits(@Nonnegative long count) {
+  public void recordHits(long count) {
     if (enabled) {
       hits.add(count);
     }
@@ -105,7 +103,7 @@ public final class JCacheStatisticsMXBean implements CacheStatisticsMXBean {
    *
    * @param count the number of misses to record
    */
-  public void recordMisses(@Nonnegative long count) {
+  public void recordMisses(long count) {
     if (enabled) {
       misses.add(count);
     }
@@ -126,7 +124,7 @@ public final class JCacheStatisticsMXBean implements CacheStatisticsMXBean {
    *
    * @param count the number of writes to record
    */
-  public void recordPuts(@Nonnegative long count) {
+  public void recordPuts(long count) {
     if (enabled && (count != 0)) {
       puts.add(count);
     }
@@ -142,7 +140,7 @@ public final class JCacheStatisticsMXBean implements CacheStatisticsMXBean {
    *
    * @param count the number of removals to record
    */
-  public void recordRemovals(@Nonnegative long count) {
+  public void recordRemovals(long count) {
     if (enabled) {
       removals.add(count);
     }
@@ -158,7 +156,7 @@ public final class JCacheStatisticsMXBean implements CacheStatisticsMXBean {
    *
    * @param count the number of evictions to record
    */
-  public void recordEvictions(@Nonnegative long count) {
+  public void recordEvictions(long count) {
     if (enabled) {
       evictions.add(count);
     }
@@ -217,7 +215,7 @@ public final class JCacheStatisticsMXBean implements CacheStatisticsMXBean {
     if ((requestCount == 0) || (opsTimeNanos == 0)) {
       return 0;
     }
-    long opsTimeMillis = TimeUnit.MILLISECONDS.toNanos(opsTimeNanos);
-    return (float) opsTimeMillis / requestCount;
+    long opsTimeMicro = TimeUnit.NANOSECONDS.toMicros(opsTimeNanos);
+    return (float) opsTimeMicro / requestCount;
   }
 }

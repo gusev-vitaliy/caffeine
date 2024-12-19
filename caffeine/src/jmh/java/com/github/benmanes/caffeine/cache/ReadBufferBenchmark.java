@@ -15,6 +15,7 @@
  */
 package com.github.benmanes.caffeine.cache;
 
+import org.openjdk.jmh.annotations.AuxCounters;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.Group;
 import org.openjdk.jmh.annotations.GroupThreads;
@@ -24,6 +25,7 @@ import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
 
 import com.github.benmanes.caffeine.cache.buffer.BufferType;
+import com.github.benmanes.caffeine.cache.buffer.ReadBuffer;
 
 /**
  * A concurrent benchmark for read buffer implementation options. A read buffer may be a lossy,
@@ -47,14 +49,34 @@ public class ReadBufferBenchmark {
   @Param BufferType bufferType;
   ReadBuffer<Boolean> buffer;
 
+  @AuxCounters
+  @State(Scope.Thread)
+  public static class RecordCounter {
+    public int recordFailed;
+    public int recordSuccess;
+    public int recordFull;
+  }
+
   @Setup
   public void setup() {
     buffer = bufferType.create();
   }
 
   @Benchmark @Group @GroupThreads(8)
-  public void record() {
-    buffer.offer(Boolean.TRUE);
+  public void record(RecordCounter counters) {
+    switch (buffer.offer(Boolean.TRUE)) {
+      case ReadBuffer.FAILED:
+        counters.recordFailed++;
+        break;
+      case ReadBuffer.SUCCESS:
+        counters.recordSuccess++;
+        break;
+      case ReadBuffer.FULL:
+        counters.recordFull++;
+        break;
+      default:
+        throw new IllegalStateException();
+    }
   }
 
   @Benchmark @Group @GroupThreads(1)

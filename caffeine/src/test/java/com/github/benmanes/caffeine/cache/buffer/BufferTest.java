@@ -15,8 +15,7 @@
  */
 package com.github.benmanes.caffeine.cache.buffer;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.is;
+import static com.google.common.truth.Truth.assertThat;
 
 import java.util.Arrays;
 import java.util.Iterator;
@@ -24,7 +23,6 @@ import java.util.Iterator;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
-import com.github.benmanes.caffeine.cache.ReadBuffer;
 import com.github.benmanes.caffeine.testing.ConcurrentTestHarness;
 
 /**
@@ -43,29 +41,33 @@ public final class BufferTest {
   }
 
   @Test(dataProvider = "buffers")
-  public void record(ReadBuffer<Boolean> buffer) {
+  @SuppressWarnings("ThreadPriorityCheck")
+  public void offer(ReadBuffer<Boolean> buffer) {
     ConcurrentTestHarness.timeTasks(100, () -> {
       for (int i = 0; i < 1000; i++) {
-        buffer.offer(Boolean.TRUE);
+        int added = buffer.offer(Boolean.TRUE);
+        assertThat(added).isAnyOf(ReadBuffer.SUCCESS, ReadBuffer.FAILED, ReadBuffer.FULL);
         Thread.yield();
       }
     });
-    int recorded = buffer.recorded();
-    assertThat(recorded, is(ReadBuffer.BUFFER_SIZE));
+    long recorded = buffer.writes();
+    assertThat(recorded).isEqualTo(ReadBuffer.BUFFER_SIZE);
   }
 
   @Test(dataProvider = "buffers")
   public void drain(ReadBuffer<Boolean> buffer) {
     for (int i = 0; i < 2 * ReadBuffer.BUFFER_SIZE; i++) {
-      buffer.offer(Boolean.TRUE);
+      int added = buffer.offer(Boolean.TRUE);
+      assertThat(added).isAnyOf(ReadBuffer.SUCCESS, ReadBuffer.FULL);
     }
     buffer.drain();
-    int drained = buffer.drained();
-    int recorded = buffer.recorded();
-    assertThat(drained, is(recorded));
+    long drained = buffer.reads();
+    long recorded = buffer.writes();
+    assertThat(drained).isEqualTo(recorded);
   }
 
   @Test(dataProvider = "buffers")
+  @SuppressWarnings("ThreadPriorityCheck")
   public void recordAndDrain(ReadBuffer<Boolean> buffer) {
     ConcurrentTestHarness.timeTasks(100, () -> {
       for (int i = 0; i < 1000; i++) {
@@ -77,8 +79,8 @@ public final class BufferTest {
       }
     });
     buffer.drain();
-    int drained = buffer.drained();
-    int recorded = buffer.recorded();
-    assertThat(drained, is(recorded));
+    long drained = buffer.reads();
+    long recorded = buffer.writes();
+    assertThat(drained).isEqualTo(recorded);
   }
 }

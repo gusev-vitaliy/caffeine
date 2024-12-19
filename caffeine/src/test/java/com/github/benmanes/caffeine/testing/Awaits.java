@@ -15,22 +15,24 @@
  */
 package com.github.benmanes.caffeine.testing;
 
-import java.util.concurrent.TimeUnit;
+import java.time.Duration;
 
-import com.jayway.awaitility.Awaitility;
-import com.jayway.awaitility.core.ConditionFactory;
+import org.awaitility.Awaitility;
+import org.awaitility.core.ConditionFactory;
 
 /**
  * @author ben.manes@gmail.com (Ben Manes)
  */
 public final class Awaits {
+  private static final Duration ONE_MILLISECOND = Duration.ofMillis(1);
 
   private Awaits() {}
 
   /** Returns a configured {@link ConditionFactory} that polls at a short interval. */
   public static ConditionFactory await() {
     return Awaitility.with()
-        .pollDelay(1, TimeUnit.MILLISECONDS).and()
-        .pollInterval(1, TimeUnit.MILLISECONDS);
+        .pollDelay(ONE_MILLISECOND)
+        .pollInterval(ONE_MILLISECOND)
+        .pollExecutorService(ConcurrentTestHarness.executor);
   }
 }

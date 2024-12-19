@@ -15,59 +15,70 @@
  */
 package com.github.benmanes.caffeine.cache;
 
+import static com.github.benmanes.caffeine.cache.Caffeine.UNSET_INT;
+
 import java.io.Serializable;
-import java.util.concurrent.TimeUnit;
+import java.time.Duration;
+
+import org.jspecify.annotations.Nullable;
 
 /**
- * Serializes the configuration of the cache, reconsitituting it as a {@link Cache},
- * {@link LoadingCache}, or {@link AsyncLoadingCache} using {@link Caffeine} upon
- * deserialization. The data held by the cache is not retained.
+ * Serializes the configuration of the cache, reconstituting it as a {@link Cache},
+ * {@link LoadingCache}, {@link AsyncCache}, or {@link AsyncLoadingCache} using {@link Caffeine}
+ * upon deserialization. The data held by the cache is not retained.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@SuppressWarnings("serial")
 final class SerializationProxy<K, V> implements Serializable {
   private static final long serialVersionUID = 1;
 
-  Ticker ticker;
   boolean async;
   boolean weakKeys;
   boolean weakValues;
   boolean softValues;
-  Weigher<?, ?> weigher;
-  CacheLoader<?, ?> loader;
-  CacheWriter<?, ?> writer;
   boolean isRecordingStats;
+  long refreshAfterWriteNanos;
   long expiresAfterWriteNanos;
   long expiresAfterAccessNanos;
-  long refreshAfterWriteNanos;
-  RemovalListener<?, ?> removalListener;
-  long maximumSize = Caffeine.UNSET_INT;
-  long maximumWeight = Caffeine.UNSET_INT;
+  long maximumSize = UNSET_INT;
+  long maximumWeight = UNSET_INT;
 
-  @SuppressWarnings("unchecked")
+  @Nullable Ticker ticker;
+  @Nullable Expiry<?, ?> expiry;
+  @Nullable Weigher<?, ?> weigher;
+  @Nullable AsyncCacheLoader<?, ?> cacheLoader;
+  @Nullable RemovalListener<?, ?> removalListener;
+  @Nullable RemovalListener<?, ?> evictionListener;
+
   Caffeine<Object, Object> recreateCaffeine() {
-    Caffeine<Object, Object> builder = Caffeine.newBuilder();
+    var builder = Caffeine.newBuilder();
     if (ticker != null) {
       builder.ticker(ticker);
     }
     if (isRecordingStats) {
       builder.recordStats();
     }
-    if (maximumSize != Caffeine.UNSET_INT) {
+    if (maximumSize != UNSET_INT) {
       builder.maximumSize(maximumSize);
     }
-    if (maximumWeight != Caffeine.UNSET_INT) {
+    if (weigher != null) {
+      @SuppressWarnings("unchecked")
+      var castedWeigher = (Weigher<Object, Object>) weigher;
       builder.maximumWeight(maximumWeight);
-      builder.weigher((Weigher<Object, Object>) weigher);
+      builder.weigher(castedWeigher);
+    }
+    if (expiry != null) {
+      builder.expireAfter(expiry);
     }
     if (expiresAfterWriteNanos > 0) {
-      builder.expireAfterWrite(expiresAfterWriteNanos, TimeUnit.NANOSECONDS);
+      builder.expireAfterWrite(Duration.ofNanos(expiresAfterWriteNanos));
     }
     if (expiresAfterAccessNanos > 0) {
-      builder.expireAfterAccess(expiresAfterAccessNanos, TimeUnit.NANOSECONDS);
+      builder.expireAfterAccess(Duration.ofNanos(expiresAfterAccessNanos));
     }
     if (refreshAfterWriteNanos > 0) {
-      builder.refreshAfterWrite(refreshAfterWriteNanos, TimeUnit.NANOSECONDS);
+      builder.refreshAfterWrite(Duration.ofNanos(refreshAfterWriteNanos));
     }
     if (weakKeys) {
       builder.weakKeys();
@@ -79,21 +90,30 @@ final class SerializationProxy<K, V> implements Serializable {
       builder.softValues();
     }
     if (removalListener != null) {
-      builder.removalListener((RemovalListener<Object, Object>) removalListener);
+      builder.removalListener(removalListener);
     }
-    if (writer != CacheWriter.disabledWriter()) {
-      builder.writer(writer);
+    if (evictionListener != null) {
+      builder.evictionListener(evictionListener);
     }
     return builder;
   }
 
   Object readResolve() {
-    Caffeine<Object, Object> builder = recreateCaffeine();
+    var builder = recreateCaffeine();
     if (async) {
+      if (cacheLoader == null) {
+        return builder.buildAsync();
+      }
+      @SuppressWarnings("unchecked")
+      var loader = (AsyncCacheLoader<K, V>) cacheLoader;
       return builder.buildAsync(loader);
-    } else if (loader != null) {
-      return builder.build(loader);
     }
-    return builder.build();
+
+    if (cacheLoader == null) {
+      return builder.build();
+    }
+    @SuppressWarnings("unchecked")
+    var loader = (CacheLoader<K, V>) cacheLoader;
+    return builder.build(loader);
   }
 }

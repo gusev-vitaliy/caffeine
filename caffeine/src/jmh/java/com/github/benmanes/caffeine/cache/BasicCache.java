@@ -15,24 +15,26 @@
  */
 package com.github.benmanes.caffeine.cache;
 
-import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
-import javax.annotation.concurrent.ThreadSafe;
+import org.jspecify.annotations.Nullable;
 
 /**
  * A facade for benchmark implementations.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-@ThreadSafe
 public interface BasicCache<K, V> {
 
   /** Returns the value stored in the cache, or null if not present. */
-  @Nullable
-  V get(@Nonnull K key);
+  @Nullable V get(K key);
 
   /** Stores the value into the cache, replacing an existing mapping if present. */
-  void put(@Nonnull K key, @Nonnull V value);
+  void put(K key, V value);
+
+  /** Removes the entry from the cache, if present. */
+  void remove(K key);
+
+  /** Invalidates all entries from the cache. */
+  void clear();
 
   /** Performs any pending maintenance operations needed by the cache. */
   default void cleanUp() {}

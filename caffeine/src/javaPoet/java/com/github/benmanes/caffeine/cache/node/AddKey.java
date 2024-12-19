@@ -15,75 +15,72 @@
  */
 package com.github.benmanes.caffeine.cache.node;
 
-import static com.github.benmanes.caffeine.cache.Specifications.PACKAGE_NAME;
-import static com.github.benmanes.caffeine.cache.Specifications.UNSAFE_ACCESS;
 import static com.github.benmanes.caffeine.cache.Specifications.kTypeVar;
-import static com.github.benmanes.caffeine.cache.Specifications.newFieldOffset;
-import static com.github.benmanes.caffeine.cache.Specifications.offsetName;
-import static com.google.common.base.Preconditions.checkState;
+import static com.github.benmanes.caffeine.cache.Specifications.referenceType;
+import static com.github.benmanes.caffeine.cache.node.NodeContext.varHandleName;
 
 import javax.lang.model.element.Modifier;
 
-import com.github.benmanes.caffeine.cache.Feature;
+import com.github.benmanes.caffeine.cache.node.NodeContext.Visibility;
 import com.squareup.javapoet.ClassName;
 import com.squareup.javapoet.FieldSpec;
 import com.squareup.javapoet.MethodSpec;
-import com.squareup.javapoet.ParameterizedTypeName;
-import com.squareup.javapoet.TypeName;
 
 /**
  * Adds the key to the node.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class AddKey extends NodeRule {
+public final class AddKey implements NodeRule {
 
   @Override
-  protected boolean applies() {
-    return isBaseClass();
+  public boolean applies(NodeContext context) {
+    return context.isBaseClass();
   }
 
   @Override
-  protected void execute() {
-    context.nodeSubtype
-        .addField(newFieldOffset(context.className, "key"))
-        .addField(newKeyField())
-        .addMethod(newGetter(keyStrength(), kTypeVar, "key", Visibility.LAZY))
-        .addMethod(newGetRef("key"));
-    addKeyConstructorAssignment(context.constructorByKey, false);
-    addKeyConstructorAssignment(context.constructorByKeyRef, true);
-  }
-
-  private FieldSpec newKeyField() {
-    Modifier[] modifiers = { Modifier.PRIVATE, Modifier.VOLATILE };
-    FieldSpec.Builder fieldSpec = isStrongKeys()
-        ? FieldSpec.builder(kTypeVar, "key", modifiers)
-        : FieldSpec.builder(keyReferenceType(), "key", modifiers);
-    return fieldSpec.build();
-  }
-
-  private boolean isStrongKeys() {
-    return context.parentFeatures.contains(Feature.STRONG_KEYS)
-        || context.generateFeatures.contains(Feature.STRONG_KEYS);
-  }
-
-  private TypeName keyReferenceType() {
-    checkState(context.generateFeatures.contains(Feature.WEAK_KEYS));
-    return ParameterizedTypeName.get(
-        ClassName.get(PACKAGE_NAME + ".References", "WeakKeyReference"), kTypeVar);
-  }
-
-  /** Adds a constructor assignment. */
-  private void addKeyConstructorAssignment(MethodSpec.Builder constructor, boolean isReference) {
-    if (isReference || isStrongKeys()) {
-      String refAssignment = isStrongKeys()
-          ? "(K) keyReference"
-          : "(WeakKeyReference<K>) keyReference";
-      constructor.addStatement("$T.UNSAFE.putObject(this, $N, $N)",
-          UNSAFE_ACCESS, offsetName("key"), isReference ? refAssignment : "key");
+  public void execute(NodeContext context) {
+    if (context.isStrongValues()) {
+      addIfStrongValue(context);
     } else {
-      constructor.addStatement("$T.UNSAFE.putObject(this, $N, new $T($N, $N))",
-          UNSAFE_ACCESS, offsetName("key"), keyReferenceType(), "key", "keyReferenceQueue");
+      addIfCollectedValue(context);
     }
+  }
+
+  private static void addIfStrongValue(NodeContext context) {
+    var fieldSpec = context.isStrongKeys()
+        ? FieldSpec.builder(kTypeVar, "key", Modifier.VOLATILE)
+        : FieldSpec.builder(context.keyReferenceType(), "key", Modifier.VOLATILE);
+    context.nodeSubtype
+        .addField(fieldSpec.build())
+        .addMethod(context.newGetter(context.keyStrength(), kTypeVar, "key", Visibility.PLAIN))
+        .addMethod(context.newGetRef("key"));
+    context.addVarHandle("key", context.isStrongKeys()
+        ? ClassName.get(Object.class)
+        : context.keyReferenceType().rawType);
+  }
+
+  private static void addIfCollectedValue(NodeContext context) {
+    context.nodeSubtype.addMethod(MethodSpec.methodBuilder("getKeyReference")
+        .addModifiers(context.publicFinalModifiers())
+        .returns(Object.class)
+        .addStatement("$1T valueRef = ($1T) $2L.get(this)",
+            context.valueReferenceType(), varHandleName("value"))
+        .addStatement("return valueRef.getKeyReference()")
+        .build());
+
+    var getKey = MethodSpec.methodBuilder("getKey")
+        .addModifiers(context.publicFinalModifiers())
+        .returns(kTypeVar)
+        .addStatement("$1T valueRef = ($1T) $2L.get(this)",
+            context.valueReferenceType(), varHandleName("value"));
+    if (context.isStrongKeys()) {
+      getKey.addStatement("return ($T) valueRef.getKeyReference()", kTypeVar);
+    } else {
+      getKey.addStatement("$1T keyRef = ($1T) valueRef.getKeyReference()", referenceType);
+      getKey.addStatement("return keyRef.get()");
+    }
+    context.nodeSubtype.addMethod(getKey.build());
+    context.suppressedWarnings.add("unchecked");
   }
 }

@@ -15,18 +15,21 @@
  */
 package com.github.benmanes.caffeine.cache.simulator.policy.linked;
 
-import static com.google.common.base.Preconditions.checkState;
-import static java.util.Objects.requireNonNull;
-import static java.util.stream.Collectors.toSet;
+import static com.github.benmanes.caffeine.cache.simulator.policy.Policy.Characteristic.WEIGHTED;
+import static java.util.Locale.US;
+import static java.util.stream.Collectors.toUnmodifiableSet;
 
 import java.util.Set;
 
 import org.apache.commons.lang3.StringUtils;
+import org.jspecify.annotations.Nullable;
 
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
 import com.github.benmanes.caffeine.cache.simulator.admission.Admission;
 import com.github.benmanes.caffeine.cache.simulator.admission.Admittor;
+import com.github.benmanes.caffeine.cache.simulator.policy.AccessEvent;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
 import com.google.common.base.MoreObjects;
 import com.typesafe.config.Config;
@@ -40,31 +43,38 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@PolicySpec(characteristics = WEIGHTED)
 public final class LinkedPolicy implements Policy {
-  private final Long2ObjectMap<Node> data;
-  private final PolicyStats policyStats;
-  private final EvictionPolicy policy;
-  private final Admittor admittor;
-  private final int maximumSize;
-  private final Node sentinel;
+  final Long2ObjectMap<Node> data;
+  final PolicyStats policyStats;
+  final EvictionPolicy policy;
+  final Admittor admittor;
+  final long maximumSize;
+  final boolean weighted;
+  final Node sentinel;
 
-  public LinkedPolicy(Admission admission, EvictionPolicy policy, Config config) {
-    String name = admission.format("linked." + policy.label());
-    BasicSettings settings = new BasicSettings(config);
+  long currentSize;
+
+  public LinkedPolicy(Config config, Set<Characteristic> characteristics,
+      Admission admission, EvictionPolicy policy) {
+    this.policyStats = new PolicyStats(admission.format(policy.label()));
+    this.admittor = admission.from(config, policyStats);
+    this.weighted = characteristics.contains(WEIGHTED);
+
+    var settings = new BasicSettings(config);
     this.data = new Long2ObjectOpenHashMap<>();
     this.maximumSize = settings.maximumSize();
-    this.policyStats = new PolicyStats(name);
-    this.admittor = admission.from(config);
     this.sentinel = new Node();
     this.policy = policy;
   }
 
   /** Returns all variations of this policy based on the configuration parameters. */
-  public static Set<Policy> policies(Config config, EvictionPolicy policy) {
-    BasicSettings settings = new BasicSettings(config);
+  public static Set<Policy> policies(Config config,
+      Set<Characteristic> characteristics, EvictionPolicy policy) {
+    var settings = new BasicSettings(config);
     return settings.admission().stream().map(admission ->
-      new LinkedPolicy(admission, policy, config)
-    ).collect(toSet());
+      new LinkedPolicy(config, characteristics, admission, policy)
+    ).collect(toUnmodifiableSet());
   }
 
   @Override
@@ -73,32 +83,48 @@ public final class LinkedPolicy implements Policy {
   }
 
   @Override
-  public void record(long key) {
+  public void record(AccessEvent event) {
+    int weight = weighted ? event.weight() : 1;
+    long key = event.key();
     Node old = data.get(key);
     admittor.record(key);
     if (old == null) {
-      Node node = new Node(key, sentinel);
-      policyStats.recordMiss();
+      policyStats.recordWeightedMiss(weight);
+      if (weight > maximumSize) {
+        policyStats.recordOperation();
+        return;
+      }
+      var node = new Node(key, weight, sentinel);
       data.put(key, node);
+      currentSize += node.weight;
       node.appendToTail();
       evict(node);
     } else {
-      policyStats.recordHit();
+      policyStats.recordWeightedHit(weight);
+      currentSize += (weight - old.weight);
+      old.weight = weight;
+
       policy.onAccess(old, policyStats);
+      evict(old);
     }
   }
 
   /** Evicts while the map exceeds the maximum capacity. */
   private void evict(Node candidate) {
-    if (data.size() > maximumSize) {
-      Node victim = policy.findVictim(sentinel, policyStats);
-      policyStats.recordEviction();
+    if (currentSize > maximumSize) {
+      while (currentSize > maximumSize) {
+        if (candidate.weight > maximumSize) {
+          evictEntry(candidate);
+          continue;
+        }
 
-      boolean admit = admittor.admit(candidate.key, victim.key);
-      if (admit) {
-        evictEntry(victim);
-      } else {
-        evictEntry(candidate);
+        Node victim = policy.findVictim(sentinel, policyStats);
+        boolean admit = admittor.admit(candidate.key, victim.key);
+        if (admit) {
+          evictEntry(victim);
+        } else {
+          evictEntry(candidate);
+        }
       }
     } else {
       policyStats.recordOperation();
@@ -106,6 +132,8 @@ public final class LinkedPolicy implements Policy {
   }
 
   private void evictEntry(Node node) {
+    policyStats.recordEviction();
+    currentSize -= node.weight;
     data.remove(node.key);
     node.remove();
   }
@@ -174,7 +202,7 @@ public final class LinkedPolicy implements Policy {
     };
 
     public String label() {
-      return StringUtils.capitalize(name().toLowerCase());
+      return "linked." + StringUtils.capitalize(name().toLowerCase(US));
     }
 
     /** Performs any operations required by the policy after a node was successfully retrieved. */
@@ -186,12 +214,14 @@ public final class LinkedPolicy implements Policy {
 
   /** A node on the double-linked list. */
   static final class Node {
-    private final Node sentinel;
+    final Node sentinel;
 
-    private boolean marked;
-    private Node prev;
-    private Node next;
-    private long key;
+    @Nullable Node prev;
+    @Nullable Node next;
+
+    long key;
+    int weight;
+    boolean marked;
 
     /** Creates a new sentinel node. */
     public Node() {
@@ -202,9 +232,10 @@ public final class LinkedPolicy implements Policy {
     }
 
     /** Creates a new, unlinked node. */
-    public Node(long key, Node sentinel) {
+    public Node(long key, int weight, Node sentinel) {
       this.sentinel = sentinel;
       this.key = key;
+      this.weight = weight;
     }
 
     /** Appends the node to the tail of the list. */
@@ -224,25 +255,8 @@ public final class LinkedPolicy implements Policy {
       key = Long.MIN_VALUE;
     }
 
-    /** Moves the node to the head. */
-    public void moveToHead() {
-      checkState(key != Long.MIN_VALUE);
-
-      // unlink
-      prev.next = next;
-      next.prev = prev;
-
-      // link
-      next = sentinel.next;
-      prev = sentinel;
-      sentinel.next = this;
-      next.prev = this;
-    }
-
     /** Moves the node to the tail. */
     public void moveToTail() {
-      requireNonNull(key);
-
       // unlink
       prev.next = next;
       next.prev = prev;
@@ -258,6 +272,7 @@ public final class LinkedPolicy implements Policy {
     public String toString() {
       return MoreObjects.toStringHelper(this)
           .add("key", key)
+          .add("weight", weight)
           .add("marked", marked)
           .toString();
     }

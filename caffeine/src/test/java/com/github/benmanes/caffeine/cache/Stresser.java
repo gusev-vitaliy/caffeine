@@ -1,5 +1,5 @@
 /*
- * Copyright 2011 Google Inc. All Rights Reserved.
+ * Copyright 2014 Ben Manes. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,106 +15,165 @@
  */
 package com.github.benmanes.caffeine.cache;
 
+import static java.util.Locale.US;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 import java.time.LocalTime;
 import java.util.Arrays;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.atomic.LongAdder;
 
 import org.apache.commons.lang3.StringUtils;
 
 import com.github.benmanes.caffeine.testing.ConcurrentTestHarness;
+import com.google.common.base.Stopwatch;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
+import picocli.CommandLine;
+import picocli.CommandLine.Command;
+import picocli.CommandLine.Help;
+import picocli.CommandLine.Option;
+
 /**
- * A stress test to observe if the cache has a memory leak by not being able to drain the buffers
- * fast enough.
+ * A stress test to observe if the cache is able to drain the buffers fast enough under a synthetic
+ * load.
+ * <p>
+ * <pre>{@code
+ *   ./gradlew :caffeine:stress --workload=[read, write, refresh]
+ * }</pre>
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class Stresser {
-  private static final String[] STATUS = { "Idle", "Required", "Processing" };
-  private static final int THREADS = 2 * Runtime.getRuntime().availableProcessors();
-  private static final long STATUS_INTERVAL = 5;
-  private static final int MAX_SIZE = (1 << 12);
-  private static final int LENGTH = (1 << 20);
-  private static final int MASK = LENGTH - 1;
+@Command(mixinStandardHelpOptions = true)
+public final class Stresser implements Runnable {
+  private static final String[] STATUS =
+    { "Idle", "Required", "Processing -> Idle", "Processing -> Required" };
+  private static final int MAX_THREADS = 2 * Runtime.getRuntime().availableProcessors();
+  private static final int WRITE_MAX_SIZE = (1 << 12); // 4,096
+  private static final int TOTAL_KEYS = (1 << 20); // 1,048,576
+  private static final int MASK = TOTAL_KEYS - 1;
+  private static final int STATUS_INTERVAL = 5;
 
-  private final BoundedLocalCache<Integer, Integer> local;
-  private final ScheduledExecutorService statusExecutor;
-  private final Cache<Integer, Integer> cache;
-  private final LongAdder evictions;
-  private final Integer[] ints;
+  @Option(names = "--workload", required = true,
+      description = "The workload type: ${COMPLETION-CANDIDATES}")
+  private Workload workload;
 
-  private final boolean reads = false;
+  private BoundedLocalCache<Integer, Integer> local;
+  private LoadingCache<Integer, Integer> cache;
+  private Stopwatch stopwatch;
+  private Integer[] ints;
 
-  public Stresser() {
-    ThreadFactory threadFactory = new ThreadFactoryBuilder()
+  @Override
+  public void run() {
+    initialize();
+    execute();
+  }
+
+  @SuppressWarnings({"CheckReturnValue", "FutureReturnValueIgnored"})
+  private void initialize() {
+    var threadFactory = new ThreadFactoryBuilder()
         .setPriority(Thread.MAX_PRIORITY)
         .setDaemon(true)
         .build();
-    statusExecutor = Executors.newSingleThreadScheduledExecutor(threadFactory);
-    statusExecutor.scheduleAtFixedRate(newStatusTask(), THREADS, STATUS_INTERVAL, SECONDS);
-    evictions = new LongAdder();
+    Executors.newSingleThreadScheduledExecutor(threadFactory)
+        .scheduleAtFixedRate(this::status, STATUS_INTERVAL, STATUS_INTERVAL, SECONDS);
     cache = Caffeine.newBuilder()
-        .removalListener((k, v, c) -> evictions.increment())
-        .maximumSize(reads ? LENGTH : MAX_SIZE)
-        .initialCapacity(MAX_SIZE)
-        .build();
+        .maximumSize(workload.maxEntries)
+        .recordStats()
+        .build(key -> key);
     local = (BoundedLocalCache<Integer, Integer>) cache.asMap();
-
-    ints = new Integer[LENGTH];
-    Arrays.setAll(ints, i-> {
-      Integer key = i;
+    ints = new Integer[TOTAL_KEYS];
+    Arrays.setAll(ints, key -> {
       cache.put(key, key);
       return key;
     });
+    cache.cleanUp();
+    local.refreshes();
+    stopwatch = Stopwatch.createStarted();
+    status();
   }
 
-  public void run() throws InterruptedException {
-    ConcurrentTestHarness.timeTasks(THREADS, () -> {
+  @SuppressWarnings({"CheckReturnValue", "FutureReturnValueIgnored"})
+  private void execute() {
+    ConcurrentTestHarness.timeTasks(workload.maxThreads, () -> {
       int index = ThreadLocalRandom.current().nextInt();
       for (;;) {
         Integer key = ints[index++ & MASK];
-        if (reads) {
-          cache.getIfPresent(ints[index++ & MASK]);
-        } else {
-          cache.put(key, key);
-          Thread.yield();
+        switch (workload) {
+          case READ:
+            cache.getIfPresent(key);
+            break;
+          case WRITE:
+            cache.put(key, key);
+            break;
+          case REFRESH:
+            cache.refresh(key);
+            break;
         }
       }
     });
   }
 
-  private Runnable newStatusTask() {
-    return new Runnable() {
-      long runningTime;
+  @SuppressWarnings("SystemOut")
+  private void status() {
+    var evictionLock = local.evictionLock;
+    int pendingWrites;
+    int drainStatus;
 
-      @Override
-      public void run() {
-        local.evictionLock.lock();
-        int pendingWrites = local.writeQueue().size();
-        local.evictionLock.unlock();
+    evictionLock.lock();
+    try {
+      pendingWrites = local.writeBuffer.size();
+      drainStatus = local.drainStatusAcquire();
+    } finally {
+      evictionLock.unlock();
+    }
 
-        runningTime += STATUS_INTERVAL;
-        String elapsedTime = LocalTime.ofSecondOfDay(runningTime).toString();
-        System.out.printf("---------- %s ----------%n", elapsedTime);
-        System.out.printf("Pending reads = %,d%n", local.readBuffer.size());
-        System.out.printf("Pending write = %,d%n", pendingWrites);
-        System.out.printf("Drain status = %s%n", STATUS[local.drainStatus]);
-        System.out.printf("Evictions = %,d%n", evictions.intValue());
-        System.out.printf("Size = %,d%n", local.data.mappingCount());
-        System.out.printf("Lock = [%s%n", StringUtils.substringAfter(
-            local.evictionLock.toString(), "["));
-      }
-    };
+    var elapsedTime = LocalTime.ofSecondOfDay(stopwatch.elapsed(SECONDS));
+    System.out.printf(US, "---------- %s ----------%n", elapsedTime);
+    System.out.printf(US, "Pending reads: %,d; writes: %,d%n",
+        local.readBuffer.size(), pendingWrites);
+    System.out.printf(US, "Drain status = %s (%s)%n", STATUS[drainStatus], drainStatus);
+    System.out.printf(US, "Evictions = %,d%n", cache.stats().evictionCount());
+    System.out.printf(US, "Size = %,d (max: %,d)%n",
+        local.data.mappingCount(), workload.maxEntries);
+    System.out.printf(US, "Lock = [%s%n", StringUtils.substringAfter(evictionLock.toString(), "["));
+    System.out.printf(US, "Pending reloads = %,d%n", local.refreshes().size());
+    System.out.printf(US, "Pending tasks = %,d%n",
+        ForkJoinPool.commonPool().getQueuedSubmissionCount());
+
+    long maxMemory = Runtime.getRuntime().maxMemory();
+    long freeMemory = Runtime.getRuntime().freeMemory();
+    long allocatedMemory = Runtime.getRuntime().totalMemory();
+    System.out.printf(US, "Max Memory = %,d bytes%n", maxMemory);
+    System.out.printf(US, "Free Memory = %,d bytes%n", freeMemory);
+    System.out.printf(US, "Allocated Memory = %,d bytes%n", allocatedMemory);
+
+    System.out.println();
   }
 
-  public static void main(String[] args) throws Exception {
-    new Stresser().run();
+  public static void main(String[] args) {
+    new CommandLine(Stresser.class)
+        .setCommandName(Stresser.class.getSimpleName())
+        .setColorScheme(Help.defaultColorScheme(Help.Ansi.ON))
+        .setCaseInsensitiveEnumValuesAllowed(true)
+        .execute(args);
+  }
+
+  private enum Workload {
+    READ(MAX_THREADS, TOTAL_KEYS),
+    WRITE(MAX_THREADS, WRITE_MAX_SIZE),
+    REFRESH(MAX_THREADS, TOTAL_KEYS / 4);
+
+    final int maxThreads;
+    final int maxEntries;
+
+    Workload(int maxThreads, int maxEntries) {
+      this.maxThreads = maxThreads;
+      this.maxEntries = maxEntries;
+    }
+    @Override public String toString() {
+      return name().toLowerCase(US);
+    }
   }
 }

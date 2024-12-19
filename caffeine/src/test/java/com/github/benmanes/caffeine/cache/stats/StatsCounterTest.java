@@ -15,90 +15,149 @@
  */
 package com.github.benmanes.caffeine.cache.stats;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.is;
-import static org.mockito.Matchers.anyInt;
-import static org.mockito.Matchers.anyLong;
+import static com.github.benmanes.caffeine.testing.LoggingEvents.logEvents;
+import static com.google.common.truth.Truth.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.slf4j.event.Level.WARN;
 
 import org.mockito.Mockito;
+import org.testng.annotations.AfterMethod;
+import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
+import com.github.benmanes.caffeine.cache.RemovalCause;
 import com.github.benmanes.caffeine.testing.ConcurrentTestHarness;
+import com.github.valfirst.slf4jtest.TestLoggerFactory;
 
 /**
  * @author ben.manes@gmail.com (Ben Manes)
  */
 public final class StatsCounterTest {
 
+  @BeforeMethod @AfterMethod
+  public void reset() {
+    TestLoggerFactory.clear();
+  }
+
   @Test
   public void disabled() {
-    StatsCounter counter = DisabledStatsCounter.INSTANCE;
+    var counter = DisabledStatsCounter.INSTANCE;
     counter.recordHits(1);
     counter.recordMisses(1);
+    counter.recordEviction(1, RemovalCause.SIZE);
     counter.recordLoadSuccess(1);
     counter.recordLoadFailure(1);
-    assertThat(counter.snapshot(), is(new CacheStats(0, 0, 0, 0, 0, 0)));
-    assertThat(counter.toString(), is(new CacheStats(0, 0, 0, 0, 0, 0).toString()));
+    assertThat(counter.snapshot()).isEqualTo(CacheStats.of(0, 0, 0, 0, 0, 0, 0));
+    assertThat(counter.toString()).isEqualTo(CacheStats.of(0, 0, 0, 0, 0, 0, 0).toString());
 
-    for (DisabledStatsCounter type : DisabledStatsCounter.values()) {
-      assertThat(DisabledStatsCounter.valueOf(type.name()), is(counter));
+    for (var type : DisabledStatsCounter.values()) {
+      assertThat(DisabledStatsCounter.valueOf(type.name())).isEqualTo(counter);
     }
   }
 
   @Test
   public void enabled() {
-    ConcurrentStatsCounter counter = new ConcurrentStatsCounter();
+    var counter = new ConcurrentStatsCounter();
     counter.recordHits(1);
     counter.recordMisses(1);
-    counter.recordEviction();
+    counter.recordEviction(10, RemovalCause.SIZE);
     counter.recordLoadSuccess(1);
     counter.recordLoadFailure(1);
-    assertThat(counter.snapshot(), is(new CacheStats(1, 1, 1, 1, 2, 1)));
-    assertThat(counter.toString(), is(new CacheStats(1, 1, 1, 1, 2, 1).toString()));
-    assertThat(counter.snapshot().toString(), is(new CacheStats(1, 1, 1, 1, 2, 1).toString()));
+    var expected = CacheStats.of(1, 1, 1, 1, 2, 1, 10);
+    assertThat(counter.snapshot()).isEqualTo(expected);
+    assertThat(counter.toString()).isEqualTo(expected.toString());
+    assertThat(counter.snapshot().toString()).isEqualTo(expected.toString());
 
     counter.incrementBy(counter);
-    assertThat(counter.snapshot(), is(new CacheStats(2, 2, 2, 2, 4, 2)));
+    assertThat(counter.snapshot()).isEqualTo(CacheStats.of(2, 2, 2, 2, 4, 2, 20));
   }
 
   @Test
   public void concurrent() {
-    StatsCounter counter = new ConcurrentStatsCounter();
+    var counter = new ConcurrentStatsCounter();
     ConcurrentTestHarness.timeTasks(5, () -> {
       counter.recordHits(1);
       counter.recordMisses(1);
-      counter.recordEviction();
+      counter.recordEviction(10, RemovalCause.SIZE);
       counter.recordLoadSuccess(1);
       counter.recordLoadFailure(1);
     });
-    assertThat(counter.snapshot(), is(new CacheStats(5, 5, 5, 5, 10, 5)));
+    assertThat(counter.snapshot()).isEqualTo(CacheStats.of(5, 5, 5, 5, 10, 5, 50));
   }
 
   @Test
   public void guarded() {
-    StatsCounter statsCounter = Mockito.mock(StatsCounter.class);
+    var counter = StatsCounter.guardedStatsCounter(new ConcurrentStatsCounter());
+    counter.recordHits(1);
+    counter.recordMisses(1);
+    counter.recordEviction(10, RemovalCause.SIZE);
+    counter.recordLoadSuccess(1);
+    counter.recordLoadFailure(1);
+    var expected = CacheStats.of(1, 1, 1, 1, 2, 1, 10);
+    assertThat(counter.snapshot()).isEqualTo(expected);
+    assertThat(counter.toString()).isEqualTo(expected.toString());
+    assertThat(counter.snapshot().toString()).isEqualTo(expected.toString());
+    assertThat(logEvents()).isEmpty();
+  }
+
+  @Test
+  public void guarded_sameInstance() {
+    var counter = StatsCounter.guardedStatsCounter(new ConcurrentStatsCounter());
+    assertThat(StatsCounter.guardedStatsCounter(counter)).isSameInstanceAs(counter);
+  }
+
+  @Test
+  public void guarded_exception() {
+    StatsCounter statsCounter = Mockito.mock();
     when(statsCounter.snapshot()).thenThrow(new NullPointerException());
-    doThrow(NullPointerException.class).when(statsCounter).recordEviction();
     doThrow(NullPointerException.class).when(statsCounter).recordHits(anyInt());
     doThrow(NullPointerException.class).when(statsCounter).recordMisses(anyInt());
+    doThrow(NullPointerException.class).when(statsCounter).recordEviction(anyInt(), any());
     doThrow(NullPointerException.class).when(statsCounter).recordLoadSuccess(anyLong());
     doThrow(NullPointerException.class).when(statsCounter).recordLoadFailure(anyLong());
 
-    StatsCounter guarded = StatsCounter.guardedStatsCounter(statsCounter);
+    var guarded = StatsCounter.guardedStatsCounter(statsCounter);
     guarded.recordHits(1);
     guarded.recordMisses(1);
-    guarded.recordEviction();
     guarded.recordLoadSuccess(1);
     guarded.recordLoadFailure(1);
-    assertThat(guarded.snapshot(), is(DisabledStatsCounter.EMPTY_STATS));
+    guarded.recordEviction(10, RemovalCause.SIZE);
+    assertThat(guarded.snapshot()).isEqualTo(CacheStats.empty());
 
     verify(statsCounter).recordHits(1);
     verify(statsCounter).recordMisses(1);
-    verify(statsCounter).recordEviction();
     verify(statsCounter).recordLoadSuccess(1);
     verify(statsCounter).recordLoadFailure(1);
+    verify(statsCounter).recordEviction(10, RemovalCause.SIZE);
+
+    assertThat(logEvents()
+        .withMessage("Exception thrown by stats counter")
+        .withThrowable(NullPointerException.class)
+        .withLevel(WARN)
+        .exclusively())
+        .hasSize(6);
+  }
+
+  @Test
+  public void overflow_loadSuccess() {
+    var counter = new ConcurrentStatsCounter();
+    counter.recordLoadSuccess(Long.MAX_VALUE);
+    counter.recordLoadSuccess(1);
+    CacheStats stats = counter.snapshot();
+    assertThat(stats.totalLoadTime()).isEqualTo(Long.MAX_VALUE);
+  }
+
+  @Test
+  public void overflow_loadFailure() {
+    var counter = new ConcurrentStatsCounter();
+    counter.recordLoadFailure(Long.MAX_VALUE);
+    counter.recordLoadFailure(1);
+    CacheStats stats = counter.snapshot();
+    assertThat(stats.totalLoadTime()).isEqualTo(Long.MAX_VALUE);
   }
 }

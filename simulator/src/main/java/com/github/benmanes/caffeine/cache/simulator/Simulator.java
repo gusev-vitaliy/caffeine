@@ -15,32 +15,33 @@
  */
 package com.github.benmanes.caffeine.cache.simulator;
 
-import java.io.IOException;
+import static com.google.common.collect.ImmutableList.toImmutableList;
+import static java.util.Locale.US;
+
+import java.util.ArrayList;
 import java.util.List;
-import java.util.PrimitiveIterator;
-import java.util.stream.Collectors;
-import java.util.stream.LongStream;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.stream.Stream;
 
 import com.github.benmanes.caffeine.cache.simulator.parser.TraceFormat;
+import com.github.benmanes.caffeine.cache.simulator.parser.TraceReader;
+import com.github.benmanes.caffeine.cache.simulator.policy.AccessEvent;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.Characteristic;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyActor;
-import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
 import com.github.benmanes.caffeine.cache.simulator.policy.Registry;
-import com.github.benmanes.caffeine.cache.simulator.report.Reporter;
 import com.google.common.base.Stopwatch;
+import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableList;
 import com.typesafe.config.Config;
-
-import akka.actor.ActorRef;
-import akka.actor.Props;
-import akka.actor.UntypedActor;
-import akka.routing.ActorRefRoutee;
-import akka.routing.BroadcastRoutingLogic;
-import akka.routing.Routee;
-import akka.routing.Router;
-import it.unimi.dsi.fastutil.longs.LongArrayList;
+import com.typesafe.config.ConfigFactory;
 
 /**
  * A simulator that broadcasts the recorded cache events to each policy and generates an aggregated
- * report. See <tt>reference.conf</tt> for details on the configuration.
+ * report. See <code>reference.conf</code> for details on the configuration.
  * <p>
  * The simulator reports the hit rate of each of the policy being evaluated. A miss may occur
  * due to,
@@ -57,87 +58,108 @@ import it.unimi.dsi.fastutil.longs.LongArrayList;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class Simulator extends UntypedActor {
-  public enum Message { START, FINISH, ERROR }
-
+public final class Simulator {
   private final BasicSettings settings;
-  private final Stopwatch stopwatch;
-  private final Reporter report;
-  private final Config config;
-  private final Router router;
-  private final int batchSize;
-  private int remaining;
 
-  public Simulator() {
-    config = getContext().system().settings().config().getConfig("caffeine.simulator");
-    settings = new BasicSettings(config);
-
-    List<Routee> routes = makeRoutes();
-    router = new Router(new BroadcastRoutingLogic(), routes);
-    remaining = routes.size();
-
-    batchSize = settings.batchSize();
-    stopwatch = Stopwatch.createStarted();
-    report = settings.report().format().create(config);
-    getSelf().tell(Message.START, ActorRef.noSender());
-  }
-
-  @Override
-  public void onReceive(Object msg) throws IOException {
-    if (msg == Message.START) {
-      broadcast();
-    } else if (msg == Message.ERROR) {
-      getContext().stop(getSelf());
-    } else if (msg instanceof PolicyStats) {
-      report.add((PolicyStats) msg);
-      if (--remaining == 0) {
-        report.print();
-        getContext().stop(getSelf());
-        System.out.println("Executed in " + stopwatch);
-      }
-    }
+  public Simulator(Config config) {
+    settings = new BasicSettings(config.getConfig("caffeine.simulator"));
   }
 
   /** Broadcast the trace events to all of the policy actors. */
-  private void broadcast() throws IOException {
-    try (LongStream events = eventStream()) {
-      LongArrayList batch = new LongArrayList(batchSize);
-      for (PrimitiveIterator.OfLong i = events.iterator(); i.hasNext();) {
-        batch.add(i.nextLong());
+  public void run() {
+    var trace = getTraceReader(settings);
+    var policies = getPolicyActors(trace.characteristics());
+    if (policies.isEmpty()) {
+      System.err.println("No active policies in the current configuration");
+      return;
+    }
+
+    try {
+      broadcast(trace, policies);
+      report(trace, policies);
+    } catch (RuntimeException e) {
+      throwError(e, policies);
+    }
+  }
+
+  private void broadcast(TraceReader trace, List<PolicyActor> policies) {
+    long skip = settings.trace().skip();
+    long limit = settings.trace().limit();
+    int batchSize = settings.actor().batchSize();
+    try (Stream<AccessEvent> events = trace.events().skip(skip).limit(limit)) {
+      var batch = new ArrayList<AccessEvent>(batchSize);
+      events.forEach(event -> {
+        batch.add(event);
         if (batch.size() == batchSize) {
-          router.route(batch, getSelf());
-          batch = new LongArrayList(batchSize);
+          var accessEvents = ImmutableList.copyOf(batch);
+          for (var policy : policies) {
+            policy.send(accessEvents);
+          }
+          batch.clear();
+        }
+      });
+
+      var remainder = ImmutableList.copyOf(batch);
+      for (var policy : policies) {
+        policy.send(remainder);
+        policy.finish();
+      }
+
+      var futures = policies.stream()
+          .map(PolicyActor::completed)
+          .toArray(CompletableFuture<?>[]::new);
+      CompletableFuture.allOf(futures).join();
+    }
+  }
+
+  private void report(TraceReader trace, List<PolicyActor> policies) {
+    var reporter = settings.report().format().create(settings.config(), trace.characteristics());
+    var results = policies.stream().map(PolicyActor::stats).collect(toImmutableList());
+    reporter.print(results);
+  }
+
+  /** Returns a trace reader for the access events. */
+  private static TraceReader getTraceReader(BasicSettings settings) {
+    if (settings.trace().isSynthetic()) {
+      return Synthetic.generate(settings.trace());
+    }
+    List<String> filePaths = settings.trace().traceFiles().paths();
+    TraceFormat format = settings.trace().traceFiles().format();
+    return format.readFiles(filePaths);
+  }
+
+  /** Returns the policy actors that asynchronously apply the trace events. */
+  private ImmutableList<PolicyActor> getPolicyActors(Set<Characteristic> characteristics) {
+    var registry = new Registry(settings, characteristics);
+    return registry.policies().stream()
+        .map(policy -> new PolicyActor(Thread.currentThread(), policy, settings))
+        .collect(toImmutableList());
+  }
+
+  /** Throws the underlying cause for the simulation failure. */
+  private static void throwError(RuntimeException error, Iterable<PolicyActor> policies) {
+    if (!Thread.currentThread().isInterrupted()) {
+      throw error;
+    }
+    for (var policy : policies) {
+      if (policy.completed().isCompletedExceptionally()) {
+        try {
+          policy.completed().join();
+        } catch (CompletionException e) {
+          Throwables.throwIfUnchecked(e.getCause());
+          e.addSuppressed(error);
+          throw e;
         }
       }
-      router.route(batch, getSelf());
-      router.route(Message.FINISH, getSelf());
-    } catch (Exception e) {
-      router.route(Message.ERROR, getSelf());
-      context().system().log().error(e, "");
-      getContext().stop(getSelf());
     }
-  }
-
-  /** Returns a stream of trace events. */
-  private LongStream eventStream() throws IOException {
-    if (settings.isSynthetic()) {
-      return Synthetic.generate(settings);
-    }
-    String filePath = settings.traceFile().path();
-    TraceFormat format = settings.traceFile().format();
-    return format.readFile(filePath).events();
-  }
-
-  /** Returns the actors to broadcast trace events to. */
-  private List<Routee> makeRoutes() {
-    return Registry.policies(settings).stream().map(policy -> {
-      ActorRef actorRef = getContext().actorOf(Props.create(PolicyActor.class, policy));
-      getContext().watch(actorRef);
-      return new ActorRefRoutee(actorRef);
-    }).collect(Collectors.toList());
+    throw error;
   }
 
   public static void main(String[] args) {
-    akka.Main.main(new String[] { Simulator.class.getName() } );
+    Logger.getLogger("").setLevel(Level.WARNING);
+    var simulator = new Simulator(ConfigFactory.load());
+    var stopwatch = Stopwatch.createStarted();
+    simulator.run();
+    System.out.printf(US, "Executed in %s%n", stopwatch);
   }
 }

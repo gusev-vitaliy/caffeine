@@ -15,40 +15,52 @@
  */
 package com.github.benmanes.caffeine.cache.simulator.admission;
 
-import com.clearspring.analytics.stream.frequency.CountMin64TinyLfu;
-import com.github.benmanes.caffeine.cache.CountMin4TinyLfu;
-import com.github.benmanes.caffeine.cache.RandomRemovalFrequencyTable;
-import com.github.benmanes.caffeine.cache.TinyCacheAdapter;
-import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
-import com.typesafe.config.Config;
+import static java.util.Locale.US;
 
-import it.unimi.dsi.fastutil.longs.Long2IntMap;
-import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+import java.util.Random;
+
+import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
+import com.github.benmanes.caffeine.cache.simulator.admission.Admittor.KeyOnlyAdmittor;
+import com.github.benmanes.caffeine.cache.simulator.admission.countmin4.ClimberResetCountMin4;
+import com.github.benmanes.caffeine.cache.simulator.admission.countmin4.IncrementalResetCountMin4;
+import com.github.benmanes.caffeine.cache.simulator.admission.countmin4.IndicatorResetCountMin4;
+import com.github.benmanes.caffeine.cache.simulator.admission.countmin4.PeriodicResetCountMin4;
+import com.github.benmanes.caffeine.cache.simulator.admission.countmin64.CountMin64TinyLfu;
+import com.github.benmanes.caffeine.cache.simulator.admission.perfect.PerfectFrequency;
+import com.github.benmanes.caffeine.cache.simulator.admission.table.RandomRemovalFrequencyTable;
+import com.github.benmanes.caffeine.cache.simulator.admission.tinycache.TinyCacheAdapter;
+import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
+import com.typesafe.config.Config;
 
 /**
  * Admits new entries based on the estimated frequency of its historic use.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class TinyLfu implements Admittor {
+public final class TinyLfu implements KeyOnlyAdmittor {
+  private final PolicyStats policyStats;
   private final Frequency sketch;
+  private final Random random;
 
-  public TinyLfu(Config config) {
-    BasicSettings settings = new BasicSettings(config);
-    String type = settings.tinyLfu().sketch();
-    if (type.equalsIgnoreCase("count-min-4")) {
-      sketch = new CountMin4TinyLfu(config);
-    } else if (type.equalsIgnoreCase("count-min-64")) {
-      sketch = new CountMin64TinyLfu(config);
-    } else if (type.equalsIgnoreCase("random-table")) {
-      sketch = new RandomRemovalFrequencyTable(config);
-    } else if (type.equalsIgnoreCase("tiny-table")) {
-      sketch = new TinyCacheAdapter(config);
-    } else if (type.equalsIgnoreCase("perfect-table")) {
-      sketch = new PerfectTinyLfu(config);
+  private final double probability;
+  private final int threshold;
+
+  public TinyLfu(Config config, PolicyStats policyStats) {
+    var settings = new BasicSettings(config);
+    this.random = new Random(settings.randomSeed());
+    this.sketch = makeSketch(settings);
+    this.policyStats = policyStats;
+    if (settings.tinyLfu().jitter().enabled()) {
+      this.threshold = settings.tinyLfu().jitter().threshold();
+      this.probability = settings.tinyLfu().jitter().probability();
     } else {
-      throw new IllegalStateException("Unknown sketch type: " + type);
+      this.threshold = Integer.MAX_VALUE;
+      this.probability = 1.0;
     }
+  }
+
+  public int frequency(long key) {
+    return sketch.frequency(key);
   }
 
   @Override
@@ -58,42 +70,38 @@ public final class TinyLfu implements Admittor {
 
   @Override
   public boolean admit(long candidateKey, long victimKey) {
-    long candidateFreq = sketch.frequency(candidateKey);
-    long victimFreq = sketch.frequency(victimKey);
-    return candidateFreq > victimFreq;
+    sketch.reportMiss();
+
+    int victimFreq = sketch.frequency(victimKey);
+    int candidateFreq = sketch.frequency(candidateKey);
+    if ((candidateFreq > victimFreq)
+        || ((candidateFreq >= threshold) && (random.nextFloat() < probability))) {
+      policyStats.recordAdmission();
+      return true;
+    }
+    policyStats.recordRejection();
+    return false;
   }
 
-  private static final class PerfectTinyLfu implements Frequency {
-    private final Long2IntMap counts;
-    private final int sampleSize;
-
-    private int size;
-
-    PerfectTinyLfu(Config config) {
-      sampleSize = 10 * new BasicSettings(config).maximumSize();
-      counts = new Long2IntOpenHashMap();
-    }
-
-    @Override
-    public int frequency(long e) {
-      return counts.get(e);
-    }
-
-    @Override
-    public void increment(long e) {
-      counts.put(e, counts.get(e) + 1);
-
-      size++;
-      if (size == sampleSize) {
-        reset();
+  /** Returns the frequency histogram. */
+  private static Frequency makeSketch(BasicSettings settings) {
+    String type = settings.tinyLfu().sketch();
+    switch (type.toLowerCase(US)) {
+      case "count-min-4": {
+        String reset = settings.tinyLfu().countMin4().reset();
+        switch (reset.toLowerCase(US)) {
+          case "climber": return new ClimberResetCountMin4(settings.config());
+          case "periodic": return new PeriodicResetCountMin4(settings.config());
+          case "indicator": return new IndicatorResetCountMin4(settings.config());
+          case "incremental": return new IncrementalResetCountMin4(settings.config());
+          default: throw new IllegalStateException("Unknown reset type: " + reset);
+        }
       }
-    }
-
-    private void reset() {
-      for (Long2IntMap.Entry entry : counts.long2IntEntrySet()) {
-        entry.setValue(entry.getValue() / 2);
-      }
-      size = (size / 2);
+      case "tiny-table": return new TinyCacheAdapter(settings.config());
+      case "count-min-64": return new CountMin64TinyLfu(settings.config());
+      case "perfect-table": return new PerfectFrequency(settings.config());
+      case "random-table": return new RandomRemovalFrequencyTable(settings.config());
+      default: throw new IllegalStateException("Unknown sketch type: " + type);
     }
   }
 }

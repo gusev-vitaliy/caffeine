@@ -17,13 +17,14 @@ package com.github.benmanes.caffeine.cache.simulator.policy.adaptive;
 
 import static com.google.common.base.Preconditions.checkState;
 
-import java.util.Set;
+import org.jspecify.annotations.Nullable;
 
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
-import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
 import com.google.common.base.MoreObjects;
-import com.google.common.collect.ImmutableSet;
+import com.google.errorprone.annotations.Var;
 import com.typesafe.config.Config;
 
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
@@ -35,7 +36,7 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  * and pages that are re-requested outside the window are of long-term utility. The temporal
  * locality window is an adaptable parameter of the algorithm.
  * <p>
- * This implementation is based on the pseudo code provided by the authors in their paper <a href=
+ * This implementation is based on the pseudocode provided by the authors in their paper<a href=
  * "https://www.usenix.org/legacy/publications/library/proceedings/fast04/tech/full_papers/bansal/bansal.pdf">
  * CAR: Clock with Adaptive Replacement</a> and is further described in their paper,
  * <p>
@@ -43,7 +44,8 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class CartPolicy implements Policy {
+@PolicySpec(name = "adaptive.Cart")
+public final class CartPolicy implements KeyOnlyPolicy {
   private final Long2ObjectMap<Node> data;
   private final PolicyStats policyStats;
   private final int maximumSize;
@@ -63,19 +65,14 @@ public final class CartPolicy implements Policy {
   private int q;
 
   public CartPolicy(Config config) {
-    BasicSettings settings = new BasicSettings(config);
-    this.policyStats = new PolicyStats("adaptive.Cart");
+    var settings = new BasicSettings(config);
+    this.maximumSize = Math.toIntExact(settings.maximumSize());
+    this.policyStats = new PolicyStats(name());
     this.data = new Long2ObjectOpenHashMap<>();
-    this.maximumSize = settings.maximumSize();
     this.headT1 = new Node();
     this.headT2 = new Node();
     this.headB1 = new Node();
     this.headB2 = new Node();
-  }
-
-  /** Returns all variations of this policy based on the configuration parameters. */
-  public static Set<Policy> policies(Config config) {
-    return ImmutableSet.of(new CartPolicy(config));
   }
 
   @Override
@@ -101,7 +98,7 @@ public final class CartPolicy implements Policy {
     policyStats.recordOperation();
   }
 
-  private void onMiss(long key, Node node) {
+  private void onMiss(long key, @Var Node node) {
     // if (|T1| + |T2| = c) then
     //   /* cache full, replace a page from cache */
     //   replace()
@@ -163,7 +160,7 @@ public final class CartPolicy implements Policy {
 
       // Set filter bit of x to "S"
       // nS = nS + 1 /* history hit */
-      node.filter = FilterType.ShortTerm;
+      node.filter = FilterType.SHORT_TERM;
       sizeS++;
     } else if (node.type == QueueType.B1) {
       // Adapt: Increase the target size for the list T1 as: p = min{p + max{1, nS / |B1|}, c}
@@ -179,7 +176,7 @@ public final class CartPolicy implements Policy {
       // Reset the page reference bit of x
       // Set nL = nL + 1.
       // Set type of x to "L".
-      node.filter = FilterType.LongTerm;
+      node.filter = FilterType.LONG_TERM;
       node.marked = false;
       sizeL++;
     } else if (node.type == QueueType.B2) {
@@ -195,7 +192,7 @@ public final class CartPolicy implements Policy {
 
       // Reset the page reference bit of x
       // Set nL = nL + 1
-      node.filter = FilterType.LongTerm;
+      node.filter = FilterType.LONG_TERM;
       node.marked = false;
       sizeL++;
 
@@ -214,7 +211,7 @@ public final class CartPolicy implements Policy {
   }
 
   private void demote() {
-    // while (the page reference bit of the head page in T2 is 1)) then
+    // while (the page reference bit of the head page in T2 is 1) then
     //   Move the head page in T2 to tail position in T1
     //   Reset the page reference bit
     //   if (|T2|+|B2|+|T1|−nS ≥ c) then
@@ -259,15 +256,15 @@ public final class CartPolicy implements Policy {
       }
     }
 
-    while ((headT1.next.filter == FilterType.LongTerm) || headT1.next.marked) {
+    while ((headT1.next.filter == FilterType.LONG_TERM) || headT1.next.marked) {
       policyStats.recordOperation();
       Node node = headT1.next;
       if (node.marked) {
         node.moveToTail(headT1);
         node.marked = false;
 
-        if ((sizeT1 >= Math.max(p + 1, sizeB1)) && (node.filter == FilterType.ShortTerm)) {
-          node.filter = FilterType.LongTerm;
+        if ((sizeT1 >= Math.max(p + 1, sizeB1)) && (node.filter == FilterType.SHORT_TERM)) {
+          node.filter = FilterType.LONG_TERM;
           sizeS--;
           sizeL++;
         }
@@ -318,21 +315,21 @@ public final class CartPolicy implements Policy {
 
   private enum QueueType {
     T1, B1,
-    T2, B2;
+    T2, B2,
   }
 
   private enum FilterType {
-    ShortTerm,
-    LongTerm;
+    SHORT_TERM,
+    LONG_TERM,
   }
 
   static final class Node {
     final long key;
 
-    Node prev;
-    Node next;
-    QueueType type;
-    FilterType filter;
+    @Nullable Node prev;
+    @Nullable Node next;
+    @Nullable QueueType type;
+    @Nullable FilterType filter;
 
     boolean marked;
 
@@ -370,7 +367,6 @@ public final class CartPolicy implements Policy {
 
     /** Removes the node from the list. */
     public void remove() {
-      checkState(key != Long.MIN_VALUE);
       prev.next = next;
       next.prev = prev;
       prev = next = null;

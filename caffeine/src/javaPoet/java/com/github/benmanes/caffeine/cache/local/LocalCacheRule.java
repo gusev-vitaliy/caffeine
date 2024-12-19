@@ -15,35 +15,16 @@
  */
 package com.github.benmanes.caffeine.cache.local;
 
-import java.util.function.Consumer;
-
-import javax.lang.model.element.Modifier;
-
 /**
+ * A code generation rule for a cache.
+ *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public abstract class LocalCacheRule implements Consumer<LocalCacheContext> {
-  protected static final Modifier[] publicFinalModifiers =
-    { Modifier.PUBLIC, Modifier.FINAL };
-  protected static final Modifier[] protectedFinalModifiers =
-    { Modifier.PROTECTED, Modifier.FINAL };
-  protected static final Modifier[] privateFinalModifiers =
-    { Modifier.PRIVATE, Modifier.FINAL };
-  protected static final Modifier[] privateVolatileModifiers =
-    { Modifier.PRIVATE, Modifier.VOLATILE };
+public interface LocalCacheRule {
 
-  protected LocalCacheContext context;
+  /** Returns if the rule should be executed. */
+  boolean applies(LocalCacheContext context);
 
-  @Override
-  public void accept(LocalCacheContext context) {
-    this.context = context;
-    if (applies()) {
-      execute();
-    }
-  }
-
-  /** @return if the rule should be executed. */
-  protected abstract boolean applies();
-
-  protected abstract void execute();
+  /** Modifies the context. */
+  void execute(LocalCacheContext context);
 }

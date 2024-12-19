@@ -17,9 +17,7 @@ package com.github.benmanes.caffeine.cache;
 
 import java.util.Arrays;
 import java.util.Random;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.function.Function;
 
 import org.openjdk.jmh.annotations.Benchmark;
@@ -29,22 +27,25 @@ import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.Threads;
 
-import com.google.common.base.Throwables;
 import com.google.common.cache.CacheBuilder;
-import com.yahoo.ycsb.generator.IntegerGenerator;
-import com.yahoo.ycsb.generator.ScrambledZipfianGenerator;
+import com.google.common.cache.CacheLoader;
+
+import site.ycsb.generator.NumberGenerator;
+import site.ycsb.generator.ScrambledZipfianGenerator;
 
 /**
  * @author ben.manes@gmail.com (Ben Manes)
  */
 @State(Scope.Benchmark)
+@SuppressWarnings({"LexicographicalAnnotationAttributeListing",
+  "MemberName", "PMD.MethodNamingConventions"})
 public class ComputeBenchmark {
   static final int SIZE = (2 << 14);
   static final int MASK = SIZE - 1;
   static final int ITEMS = SIZE / 3;
   static final Integer COMPUTE_KEY = SIZE / 2;
-  static final Callable<Boolean> valueLoader = () -> Boolean.TRUE;
   static final Function<Integer, Boolean> mappingFunction = any -> Boolean.TRUE;
+  static final CacheLoader<Integer, Boolean> cacheLoader = CacheLoader.from(key -> Boolean.TRUE);
 
   @Param({"ConcurrentHashMap", "Caffeine", "Guava"})
   String computeType;
@@ -60,13 +61,14 @@ public class ComputeBenchmark {
 
   public ComputeBenchmark() {
     ints = new Integer[SIZE];
-    IntegerGenerator generator = new ScrambledZipfianGenerator(ITEMS);
+    NumberGenerator generator = new ScrambledZipfianGenerator(ITEMS);
     for (int i = 0; i < SIZE; i++) {
-      ints[i] = generator.nextInt();
+      ints[i] = generator.nextValue().intValue();
     }
   }
 
   @Setup
+  @SuppressWarnings("ReturnValueIgnored")
   public void setup() {
     if (computeType.equals("ConcurrentHashMap")) {
       setupConcurrentHashMap();
@@ -81,17 +83,17 @@ public class ComputeBenchmark {
   }
 
   @Benchmark @Threads(32)
-  public void compute_sameKey(ThreadState threadState) {
-    benchmarkFunction.apply(COMPUTE_KEY);
+  public Boolean compute_sameKey(ThreadState threadState) {
+    return benchmarkFunction.apply(COMPUTE_KEY);
   }
 
   @Benchmark @Threads(32)
-  public void compute_spread(ThreadState threadState) {
-    benchmarkFunction.apply(ints[threadState.index++ & MASK]);
+  public Boolean compute_spread(ThreadState threadState) {
+    return benchmarkFunction.apply(ints[threadState.index++ & MASK]);
   }
 
   private void setupConcurrentHashMap() {
-    ConcurrentMap<Integer, Boolean> map = new ConcurrentHashMap<>();
+    var map = new ConcurrentHashMap<Integer, Boolean>();
     benchmarkFunction = key -> map.computeIfAbsent(key, mappingFunction);
   }
 
@@ -101,14 +103,8 @@ public class ComputeBenchmark {
   }
 
   private void setupGuava() {
-    com.google.common.cache.Cache<Integer, Boolean> cache =
-        CacheBuilder.newBuilder().concurrencyLevel(64).build();
-    benchmarkFunction = key -> {
-      try {
-        return cache.get(key, valueLoader);
-      } catch (Exception e) {
-        throw Throwables.propagate(e);
-      }
-    };
+    com.google.common.cache.LoadingCache<Integer, Boolean> cache =
+        CacheBuilder.newBuilder().concurrencyLevel(64).build(cacheLoader);
+    benchmarkFunction = cache::getUnchecked;
   }
 }

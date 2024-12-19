@@ -15,11 +15,12 @@
  */
 package com.github.benmanes.caffeine.cache.impl;
 
+import static com.github.benmanes.caffeine.cache.CacheType.CONCURRENCY_LEVEL;
+
 import com.github.benmanes.caffeine.cache.BasicCache;
-import com.github.benmanes.caffeine.cache.CacheType;
+import com.trivago.triava.tcache.Cache;
 import com.trivago.triava.tcache.EvictionPolicy;
 import com.trivago.triava.tcache.TCacheFactory;
-import com.trivago.triava.tcache.eviction.Cache;
 
 /**
  * @author ben.manes@gmail.com (Ben Manes)
@@ -27,11 +28,14 @@ import com.trivago.triava.tcache.eviction.Cache;
 public final class TCache<K, V> implements BasicCache<K, V> {
   private final Cache<K, V> cache;
 
+  @SuppressWarnings({"PMD.CloseResource", "resource"})
   public TCache(int maximumSize, EvictionPolicy policy) {
-    cache = TCacheFactory.standardFactory().<K, V>builder()
-        .setConcurrencyLevel(CacheType.CONCURRENCY_LEVEL)
-        .setExpectedMapSize(maximumSize)
+    var factory = new TCacheFactory();
+    cache = factory.<K, V>builder()
+        .setConcurrencyLevel(CONCURRENCY_LEVEL)
+        .setMaxElements(maximumSize)
         .setEvictionPolicy(policy)
+        .setStatistics(false)
         .build();
   }
 
@@ -43,5 +47,15 @@ public final class TCache<K, V> implements BasicCache<K, V> {
   @Override
   public void put(K key, V value) {
     cache.put(key, value);
+  }
+
+  @Override
+  public void remove(K key) {
+    cache.remove(key);
+  }
+
+  @Override
+  public void clear() {
+    cache.clear();
   }
 }

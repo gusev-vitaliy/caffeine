@@ -16,13 +16,20 @@
 package com.github.benmanes.caffeine.jcache.integration;
 
 import static java.util.Objects.requireNonNull;
+import static java.util.stream.Collectors.toUnmodifiableMap;
 
+import java.lang.System.Logger;
+import java.lang.System.Logger.Level;
 import java.util.Map;
-import java.util.stream.Collectors;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
+import javax.cache.expiry.Duration;
 import javax.cache.expiry.ExpiryPolicy;
 import javax.cache.integration.CacheLoader;
 import javax.cache.integration.CacheLoaderException;
+
+import org.jspecify.annotations.Nullable;
 
 import com.github.benmanes.caffeine.cache.Ticker;
 import com.github.benmanes.caffeine.jcache.CacheProxy;
@@ -36,7 +43,9 @@ import com.github.benmanes.caffeine.jcache.management.JCacheStatisticsMXBean;
  * @author ben.manes@gmail.com (Ben Manes)
  */
 public final class JCacheLoaderAdapter<K, V>
-    implements com.github.benmanes.caffeine.cache.CacheLoader<K, Expirable<V>> {
+    implements com.github.benmanes.caffeine.cache.CacheLoader<K, @Nullable Expirable<V>> {
+  private static final Logger logger = System.getLogger(JCacheLoaderAdapter.class.getName());
+
   private final JCacheStatisticsMXBean statistics;
   private final EventDispatcher<K, V> dispatcher;
   private final CacheLoader<K, V> delegate;
@@ -45,6 +54,7 @@ public final class JCacheLoaderAdapter<K, V>
 
   private CacheProxy<K, V> cache;
 
+  @SuppressWarnings("NullAway.Init")
   public JCacheLoaderAdapter(CacheLoader<K, V> delegate, EventDispatcher<K, V> dispatcher,
       ExpiryPolicy expiry, Ticker ticker, JCacheStatisticsMXBean statistics) {
     this.dispatcher = requireNonNull(dispatcher);
@@ -64,14 +74,23 @@ public final class JCacheLoaderAdapter<K, V>
   }
 
   @Override
-  public Expirable<V> load(K key) {
+  public @Nullable Expirable<V> load(K key) {
     try {
-      long start = ticker.read();
+      boolean statsEnabled = statistics.isEnabled();
+      long start = statsEnabled ? ticker.read() : 0L;
+
       V value = delegate.load(key);
+      if (value == null) {
+        return null;
+      }
+
       dispatcher.publishCreated(cache, key, value);
-      long end = ticker.read();
-      statistics.recordGetTime(start - end);
-      return new Expirable<>(value, expireTimeMS(end));
+
+      if (statsEnabled) {
+        // Subtracts the load time from the get time
+        statistics.recordGetTime(start - ticker.read());
+      }
+      return new Expirable<>(value, expireTimeMillis());
     } catch (CacheLoaderException e) {
       throw e;
     } catch (RuntimeException e) {
@@ -80,17 +99,23 @@ public final class JCacheLoaderAdapter<K, V>
   }
 
   @Override
-  public Map<K, Expirable<V>> loadAll(Iterable<? extends K> keys) {
+  public Map<K, Expirable<V>> loadAll(Set<? extends K> keys) {
     try {
-      long start = ticker.read();
+      boolean statsEnabled = statistics.isEnabled();
+      long start = statsEnabled ? ticker.read() : 0L;
+
       Map<K, Expirable<V>> result = delegate.loadAll(keys).entrySet().stream()
           .filter(entry -> (entry.getKey() != null) && (entry.getValue() != null))
-          .collect(Collectors.toMap(Map.Entry::getKey,
-              entry -> new Expirable<>(entry.getValue(), expireTimeMS(start))));
-      for (Map.Entry<K, Expirable<V>> entry : result.entrySet()) {
+          .collect(toUnmodifiableMap(Map.Entry::getKey,
+              entry -> new Expirable<>(entry.getValue(), expireTimeMillis())));
+      for (var entry : result.entrySet()) {
         dispatcher.publishCreated(cache, entry.getKey(), entry.getValue().get());
       }
-      statistics.recordGetTime(start - ticker.read());
+
+      if (statsEnabled) {
+        // Subtracts the load time from the get time
+        statistics.recordGetTime(start - ticker.read());
+      }
       return result;
     } catch (CacheLoaderException e) {
       throw e;
@@ -99,11 +124,19 @@ public final class JCacheLoaderAdapter<K, V>
     }
   }
 
-  private long expireTimeMS(long now) {
+  private long expireTimeMillis() {
     try {
-      return expiry.getExpiryForCreation().getAdjustedTime(now >> 10);
-    } catch (Exception e) {
-      return Long.MAX_VALUE;
+      Duration duration = expiry.getExpiryForCreation();
+      if (duration.isZero()) {
+        return 0;
+      } else if (duration.isEternal()) {
+        return Long.MAX_VALUE;
+      }
+      long millis = TimeUnit.NANOSECONDS.toMillis(ticker.read());
+      return duration.getAdjustedTime(millis);
+    } catch (RuntimeException e) {
+      logger.log(Level.WARNING, "Exception thrown by expiry policy", e);
+      throw e;
     }
   }
 }

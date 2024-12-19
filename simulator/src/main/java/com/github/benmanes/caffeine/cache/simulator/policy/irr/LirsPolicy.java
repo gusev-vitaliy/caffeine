@@ -19,13 +19,15 @@ import static com.google.common.base.Preconditions.checkState;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
+
+import org.jspecify.annotations.Nullable;
 
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
-import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
 import com.google.common.base.MoreObjects;
-import com.google.common.collect.ImmutableSet;
+import com.google.errorprone.annotations.Var;
 import com.typesafe.config.Config;
 
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
@@ -53,53 +55,46 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-@SuppressWarnings("PMD.TooManyFields")
-public final class LirsPolicy implements Policy {
-  private final Long2ObjectMap<Node> data;
-  private final PolicyStats policyStats;
-  private final List<Object> evicted;
-  private final Node headNR;
-  private final Node headS;
-  private final Node headQ;
-
-  private final int maximumNonResidentSize;
-  private final int stackMoveDistance;
-  private final int maximumHotSize;
-  private final int maximumSize;
-
-  private int sizeS;
-  private int sizeQ;
-  private int sizeNR;
-  private int sizeHot;
-  private int residentSize;
-  private int stackCounter;
-
+@PolicySpec(name = "irr.Lirs")
+@SuppressWarnings("MemberName")
+public final class LirsPolicy implements KeyOnlyPolicy {
   // Enable to print out the internal state
   private static final boolean debug = false;
 
+  final Long2ObjectMap<Node> data;
+  final PolicyStats policyStats;
+  final List<Object> evicted;
+  final Node headNR;
+  final Node headS;
+  final Node headQ;
+
+  final int maximumNonResidentSize;
+  final int maximumHotSize;
+  final int maximumSize;
+
+  int sizeS;
+  int sizeQ;
+  int sizeNR;
+  int sizeHot;
+  int residentSize;
+
   public LirsPolicy(Config config) {
-    LirsSettings settings = new LirsSettings(config);
-    this.maximumNonResidentSize = (int) (settings.maximumSize() * settings.nonResidentMultiplier());
-    this.stackMoveDistance = (int) (settings.maximumSize() * settings.percentFastPath());
-    this.maximumHotSize = (int) (settings.maximumSize() * settings.percentHot());
-    this.policyStats = new PolicyStats("irr.Lirs");
+    var settings = new LirsSettings(config);
+    this.maximumSize = Math.toIntExact(settings.maximumSize());
+    this.maximumNonResidentSize = (int) (maximumSize * settings.nonResidentMultiplier());
+    this.maximumHotSize = (int) (maximumSize * settings.percentHot());
+    this.policyStats = new PolicyStats(name());
     this.data = new Long2ObjectOpenHashMap<>();
-    this.maximumSize = settings.maximumSize();
     this.evicted = new ArrayList<>();
     this.headNR = new Node();
     this.headS = new Node();
     this.headQ = new Node();
   }
 
-  /** Returns all variations of this policy based on the configuration parameters. */
-  public static Set<Policy> policies(Config config) {
-    return ImmutableSet.of(new LirsPolicy(config));
-  }
-
   @Override
   public void record(long key) {
     policyStats.recordOperation();
-    Node node = data.get(key);
+    @Var Node node = data.get(key);
     if (node == null) {
       node = new Node(key);
       data.put(key,node);
@@ -122,11 +117,6 @@ public final class LirsPolicy implements Policy {
     // stack, we conduct a stack pruning. This case is illustrated in the transition from state
     // (a) to state (b) in Fig. 2.
     policyStats.recordHit();
-
-    if (node.stackMove > (stackCounter - stackMoveDistance)) {
-      // Fast path to skip the hottest entries, useful for concurrent caches
-      return;
-    }
 
     boolean wasBottom = (headS.prevS == node);
     node.moveToTop(StackType.S);
@@ -192,12 +182,12 @@ public final class LirsPolicy implements Policy {
   }
 
   /** Records a miss when the cold set is not full. */
-  private void onHirWarmupMiss(Node node) {
+  private static void onHirWarmupMiss(Node node) {
     node.status = Status.HIR_RESIDENT;
     node.moveToTop(StackType.Q);
   }
 
-  /** Records a miss when the hot set is full. */
+  /** Records a miss when the hot and cold set are full. */
   private void onFullMiss(Node node) {
     // Upon accessing an HIR non-resident block X. This is a miss. We remove the HIR resident block
     // at the bottom of stack Q (it then becomes a non-resident block) and evict it from the cache.
@@ -243,22 +233,21 @@ public final class LirsPolicy implements Policy {
     // located above it will not have a chance to change their status from HIR to LIR since their
     // recencies are larger than the new maximum recency of the LIR blocks.
     for (;;) {
-      policyStats.recordOperation();
-
       Node bottom = headS.prevS;
       if ((bottom == headS) || (bottom.status == Status.LIR)) {
         break;
       } else if (bottom.status == Status.HIR_NON_RESIDENT) {
-        // the map only needs to hold non-resident entries that are on the stack
+        // The map only needs to hold non-resident entries that are on the stack
         bottom.removeFrom(StackType.NR);
         data.remove(bottom.key);
       }
       bottom.removeFrom(StackType.S);
+      policyStats.recordOperation();
     }
 
     // Bound the number of non-resident entries. While not described in the paper, the author's
     // reference implementation provides a similar parameter to avoid uncontrolled growth.
-    Node node = headNR.prevNR;
+    @Var Node node = headNR.prevNR;
     while (sizeNR >  maximumNonResidentSize) {
       policyStats.recordOperation();
       Node removed = node;
@@ -310,7 +299,7 @@ public final class LirsPolicy implements Policy {
     checkState(sizeHot <= maximumHotSize);
     checkState(residentSize <= maximumSize);
     checkState(sizeNR <=  maximumNonResidentSize);
-    checkState(data.size() <= (maximumSize + maximumNonResidentSize));
+    checkState(data.size() <= ((long) maximumSize + maximumNonResidentSize));
     checkState(sizeS == data.values().stream().filter(node -> node.isInS).count());
     checkState(sizeQ == data.values().stream().filter(node -> node.isInQ).count());
 
@@ -350,12 +339,12 @@ public final class LirsPolicy implements Policy {
   enum Status {
     LIR,
     HIR_RESIDENT,
-    HIR_NON_RESIDENT;
+    HIR_NON_RESIDENT,
   }
 
   // S holds three types of blocks, LIR blocks, resident HIR blocks, non-resident HIR blocks
-  // Q holds all of the resident HIR blocks
-  // NR holds all of the non-resident HIR blocks
+  // Q holds the resident HIR blocks
+  // NR holds the non-resident HIR blocks
   enum StackType {
     // We store LIR blocks and HIR blocks with their recencies less than the maximum recency of the
     // LIR blocks in a stack called LIRS stack S. S is similar to the LRU stack in operation but has
@@ -365,7 +354,7 @@ public final class LirsPolicy implements Policy {
     // stack, Q, with its size of Lhirs.
     Q,
     // Adaption to facilitate the search of the non-resident HIR blocks
-    NR;
+    NR,
   }
 
   // Each entry in the stack records the LIR/HIR status of a block and its residence status,
@@ -373,15 +362,13 @@ public final class LirsPolicy implements Policy {
   final class Node {
     final long key;
 
-    Status status;
-    int stackMove;
-
-    Node prevS;
-    Node nextS;
-    Node prevQ;
-    Node nextQ;
-    Node prevNR;
-    Node nextNR;
+    @Nullable Node prevS;
+    @Nullable Node nextS;
+    @Nullable Node prevQ;
+    @Nullable Node nextQ;
+    @Nullable Node prevNR;
+    @Nullable Node nextNR;
+    @Nullable Status status;
 
     boolean isInS;
     boolean isInQ;
@@ -399,29 +386,27 @@ public final class LirsPolicy implements Policy {
     }
 
     public boolean isInStack(StackType stackType) {
-      checkState(key != Long.MIN_VALUE);
-
-      if (stackType == StackType.S) {
-        return isInS;
-      } else if (stackType == StackType.Q) {
-        return isInQ;
-      } else if (stackType == StackType.NR) {
-        return isInNR;
-      } else {
-        throw new IllegalArgumentException();
+      switch (stackType) {
+        case S:
+          return isInS;
+        case Q:
+          return isInQ;
+        case NR:
+          return isInNR;
       }
+      throw new IllegalArgumentException();
     }
 
     public boolean isStackTop(StackType stackType) {
-      if (stackType == StackType.S) {
-        return (headS.nextS == this);
-      } else if (stackType == StackType.Q) {
-        return (headQ.nextQ == this);
-      } else if (stackType == StackType.NR) {
-        return (headNR.nextNR == this);
-      } else {
-        throw new IllegalArgumentException();
+      switch (stackType) {
+        case S:
+          return (headS.nextS == this);
+        case Q:
+          return (headQ.nextQ == this);
+        case NR:
+          return (headNR.nextNR == this);
       }
+      throw new IllegalArgumentException();
     }
 
     public void moveToTop(StackType stackType) {
@@ -429,60 +414,71 @@ public final class LirsPolicy implements Policy {
         removeFrom(stackType);
       }
 
-      if (stackType == StackType.S) {
-        stackMove = ++stackCounter;
-        Node next = headS.nextS;
-        headS.nextS = this;
-        next.prevS = this;
-        this.nextS = next;
-        this.prevS = headS;
-        isInS = true;
-        sizeS++;
-      } else if (stackType == StackType.Q) {
-        Node next = headQ.nextQ;
-        headQ.nextQ = this;
-        next.prevQ = this;
-        this.nextQ = next;
-        this.prevQ = headQ;
-        isInQ = true;
-        sizeQ++;
-      } else if (stackType == StackType.NR) {
-        Node next = headNR.nextNR;
-        headNR.nextNR = this;
-        next.prevNR = this;
-        this.nextNR = next;
-        this.prevNR = headNR;
-        isInNR = true;
-        sizeNR++;
-      } else {
-        throw new IllegalArgumentException();
+      switch (stackType) {
+        case S: {
+          Node next = headS.nextS;
+          headS.nextS = this;
+          next.prevS = this;
+          this.nextS = next;
+          this.prevS = headS;
+          isInS = true;
+          sizeS++;
+          return;
+        }
+        case Q: {
+          Node next = headQ.nextQ;
+          headQ.nextQ = this;
+          next.prevQ = this;
+          this.nextQ = next;
+          this.prevQ = headQ;
+          isInQ = true;
+          sizeQ++;
+          return;
+        }
+        case NR: {
+          Node next = headNR.nextNR;
+          headNR.nextNR = this;
+          next.prevNR = this;
+          this.nextNR = next;
+          this.prevNR = headNR;
+          isInNR = true;
+          sizeNR++;
+          return;
+        }
       }
+      throw new IllegalArgumentException();
     }
 
     public void removeFrom(StackType stackType) {
       checkState(isInStack(stackType));
 
-      if (stackType == StackType.S) {
-        prevS.nextS = nextS;
-        nextS.prevS = prevS;
-        prevS = nextS = null;
-        isInS = false;
-        sizeS--;
-      } else if (stackType == StackType.Q) {
-        prevQ.nextQ = nextQ;
-        nextQ.prevQ = prevQ;
-        prevQ = nextQ = null;
-        isInQ = false;
-        sizeQ--;
-      } else if (stackType == StackType.NR) {
-        prevNR.nextNR = nextNR;
-        nextNR.prevNR = prevNR;
-        prevNR = nextNR = null;
-        isInNR = false;
-        sizeNR--;
-      } else {
-        throw new IllegalArgumentException();
+      switch (stackType) {
+        case S: {
+          prevS.nextS = nextS;
+          nextS.prevS = prevS;
+          prevS = nextS = null;
+          isInS = false;
+          sizeS--;
+          return;
+        }
+        case Q: {
+          prevQ.nextQ = nextQ;
+          nextQ.prevQ = prevQ;
+          prevQ = nextQ = null;
+          isInQ = false;
+          sizeQ--;
+          return;
+        }
+        case NR: {
+          prevNR.nextNR = nextNR;
+          nextNR.prevNR = prevNR;
+          prevNR = nextNR = null;
+          isInNR = false;
+          sizeNR--;
+          return;
+        }
       }
+      throw new IllegalArgumentException();
     }
 
     @Override
@@ -503,9 +499,6 @@ public final class LirsPolicy implements Policy {
     }
     public double nonResidentMultiplier() {
       return config().getDouble("lirs.non-resident-multiplier");
-    }
-    public double percentFastPath() {
-      return config().getDouble("lirs.percent-fast-path");
     }
   }
 }

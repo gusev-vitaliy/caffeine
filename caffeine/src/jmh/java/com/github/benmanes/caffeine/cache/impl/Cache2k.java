@@ -16,7 +16,8 @@
 package com.github.benmanes.caffeine.cache.impl;
 
 import org.cache2k.Cache;
-import org.cache2k.CacheBuilder;
+import org.cache2k.Cache2kBuilder;
+import org.cache2k.config.Cache2kConfig;
 
 import com.github.benmanes.caffeine.cache.BasicCache;
 
@@ -26,12 +27,9 @@ import com.github.benmanes.caffeine.cache.BasicCache;
 public final class Cache2k<K, V> implements BasicCache<K, V> {
   private final Cache<K, V> cache;
 
-  @SuppressWarnings("unchecked")
-  public Cache2k(Class<?> implementation, int maximumSize) {
-    cache = (Cache<K, V>) CacheBuilder.newCache(Object.class, Object.class)
-        .implementation(implementation)
-        .maxSize(maximumSize)
-        .eternal(true)
+  public Cache2k(int maximumSize) {
+    cache = Cache2kBuilder.of(new Cache2kConfig<K, V>())
+        .entryCapacity(maximumSize)
         .build();
   }
 
@@ -43,5 +41,15 @@ public final class Cache2k<K, V> implements BasicCache<K, V> {
   @Override
   public void put(K key, V value) {
     cache.put(key, value);
+  }
+
+  @Override
+  public void remove(K key) {
+    cache.remove(key);
+  }
+
+  @Override
+  public void clear() {
+    cache.clear();
   }
 }

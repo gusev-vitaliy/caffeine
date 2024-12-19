@@ -1,0 +1,15 @@
+[versions]
+caffeine = "3.1.8"
+graal = "0.10.4"
+junit = "5.11.3"
+truth = "1.4.4"
+versions = "0.51.0"
+
+[libraries]
+caffeine = { module = "com.github.ben-manes.caffeine:caffeine", version.ref = "caffeine" }
+junit = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
+truth = { module = "com.google.truth:truth", version.ref = "truth" }
+
+[plugins]
+graal = { id = "org.graalvm.buildtools.native", version.ref = "graal" }
+versions = { id = "com.github.ben-manes.versions", version.ref = "versions" }

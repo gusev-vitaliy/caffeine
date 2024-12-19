@@ -16,15 +16,19 @@
 package com.github.benmanes.caffeine.cache.simulator.policy.linked;
 
 import static com.google.common.base.Preconditions.checkState;
-import static java.util.stream.Collectors.toSet;
+import static java.util.stream.Collectors.toUnmodifiableSet;
 
 import java.util.Arrays;
 import java.util.Set;
+
+import org.jspecify.annotations.Nullable;
 
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
 import com.github.benmanes.caffeine.cache.simulator.admission.Admission;
 import com.github.benmanes.caffeine.cache.simulator.admission.Admittor;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
 import com.google.common.base.MoreObjects;
 import com.typesafe.config.Config;
@@ -38,13 +42,14 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  * higher queue (items in queue 3 move to the head of queue 3). Each queue is allocated 1/4 of the
  * total cache size and items are evicted from the tail of a queue to the head of the next lower
  * queue to maintain the size invariants. Items evicted from queue 0 are evicted from the cache."
- *
- * For more details, see <a href="http://www.cs.cornell.edu/~qhuang/papers/sosp_fbanalysis.pdf"An
+ * <p>
+ * For more details, see <a href="http://www.cs.cornell.edu/~qhuang/papers/sosp_fbanalysis.pdf">An
  * Analysis of Facebook Photo Caching</a>.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class S4LruPolicy implements Policy {
+@PolicySpec(name = "linked.S4Lru")
+public final class S4LruPolicy implements KeyOnlyPolicy {
   private final Long2ObjectMap<Node> data;
   private final PolicyStats policyStats;
   private final Admittor admittor;
@@ -54,11 +59,11 @@ public final class S4LruPolicy implements Policy {
   private final int levels;
 
   public S4LruPolicy(Admission admission, Config config) {
-    S4LruSettings settings = new S4LruSettings(config);
-    this.policyStats = new PolicyStats(admission.format("linked.S4Lru"));
+    var settings = new S4LruSettings(config);
+    this.policyStats = new PolicyStats(admission.format(name()));
+    this.maximumSize = Math.toIntExact(settings.maximumSize());
+    this.admittor = admission.from(config, policyStats);
     this.data = new Long2ObjectOpenHashMap<>();
-    this.maximumSize = settings.maximumSize();
-    this.admittor = admission.from(config);
     this.levels = settings.levels();
     this.headQ = new Node[levels];
     this.sizeQ = new int[levels];
@@ -68,10 +73,10 @@ public final class S4LruPolicy implements Policy {
 
   /** Returns all variations of this policy based on the configuration parameters. */
   public static Set<Policy> policies(Config config) {
-    BasicSettings settings = new BasicSettings(config);
+    var settings = new BasicSettings(config);
     return settings.admission().stream().map(admission ->
       new S4LruPolicy(admission, config)
-    ).collect(toSet());
+    ).collect(toUnmodifiableSet());
   }
 
   @Override
@@ -103,7 +108,7 @@ public final class S4LruPolicy implements Policy {
   }
 
   private void onMiss(long key) {
-    Node node = new Node(key);
+    var node = new Node(key);
     data.put(key, node);
     node.appendToTail(headQ[0]);
     sizeQ[0]++;
@@ -165,8 +170,9 @@ public final class S4LruPolicy implements Policy {
   static final class Node {
     final long key;
 
-    Node prev;
-    Node next;
+    @Nullable Node prev;
+    @Nullable Node next;
+
     int level;
 
     Node(long key) {
@@ -174,7 +180,7 @@ public final class S4LruPolicy implements Policy {
     }
 
     static Node sentinel(int level) {
-      Node node = new Node(Long.MIN_VALUE);
+      var node = new Node(Long.MIN_VALUE);
       node.level = level;
       node.prev = node;
       node.next = node;
@@ -190,23 +196,8 @@ public final class S4LruPolicy implements Policy {
       prev = tail;
     }
 
-    /** Moves the node to the tail. */
-    public void moveToTail(Node head) {
-      // unlink
-      prev.next = next;
-      next.prev = prev;
-
-      // link
-      next = head;
-      prev = head.prev;
-      head.prev = this;
-      prev.next = this;
-    }
-
     /** Removes the node from the list. */
     public void remove() {
-      checkState(key != Long.MIN_VALUE);
-
       prev.next = next;
       next.prev = prev;
       prev = next = null;

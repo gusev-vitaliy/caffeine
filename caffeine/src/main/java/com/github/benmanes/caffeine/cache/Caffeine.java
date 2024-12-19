@@ -15,36 +15,48 @@
  */
 package com.github.benmanes.caffeine.cache;
 
+import static java.util.Locale.US;
 import static java.util.Objects.requireNonNull;
 
+import java.lang.System.Logger;
+import java.lang.System.Logger.Level;
 import java.lang.ref.SoftReference;
 import java.lang.ref.WeakReference;
+import java.time.Duration;
+import java.util.Collection;
 import java.util.ConcurrentModificationException;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
-import java.util.logging.Logger;
 
-import javax.annotation.Nonnegative;
-import javax.annotation.Nonnull;
+import org.jspecify.annotations.NullMarked;
+import org.jspecify.annotations.Nullable;
 
+import com.github.benmanes.caffeine.cache.Async.AsyncEvictionListener;
+import com.github.benmanes.caffeine.cache.Async.AsyncExpiry;
 import com.github.benmanes.caffeine.cache.Async.AsyncRemovalListener;
 import com.github.benmanes.caffeine.cache.Async.AsyncWeigher;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import com.github.benmanes.caffeine.cache.stats.ConcurrentStatsCounter;
 import com.github.benmanes.caffeine.cache.stats.StatsCounter;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import com.google.errorprone.annotations.FormatMethod;
 
 /**
- * A builder of {@link AsyncLoadingCache}, {@link LoadingCache}, and {@link Cache} instances
- * having a combination of the following features:
+ * A builder of {@link Cache}, {@link LoadingCache}, {@link AsyncCache}, and
+ * {@link AsyncLoadingCache} instances having a combination of the following features:
  * <ul>
  *   <li>automatic loading of entries into the cache, optionally asynchronously
  *   <li>size-based eviction when a maximum is exceeded based on frequency and recency
  *   <li>time-based expiration of entries, measured since last access or last write
+ *   <li>asynchronously refresh when the first stale request for an entry occurs
  *   <li>keys automatically wrapped in {@linkplain WeakReference weak} references
  *   <li>values automatically wrapped in {@linkplain WeakReference weak} or
  *       {@linkplain SoftReference soft} references
@@ -53,15 +65,16 @@ import com.github.benmanes.caffeine.cache.stats.StatsCounter;
  *   <li>accumulation of cache access statistics
  * </ul>
  * <p>
- * These features are all optional; caches can be created using all or none of them. By default
+ * These features are all optional; caches can be created using all or none of them. By default,
  * cache instances created by {@code Caffeine} will not perform any type of eviction.
  * <p>
  * Usage example:
  * <pre>{@code
  *   LoadingCache<Key, Graph> graphs = Caffeine.newBuilder()
  *       .maximumSize(10_000)
- *       .expireAfterWrite(10, TimeUnit.MINUTES)
- *       .removalListener(MY_LISTENER)
+ *       .expireAfterWrite(Duration.ofMinutes(10))
+ *       .removalListener((Key key, Graph graph, RemovalCause cause) ->
+ *           System.out.printf("Key %s was removed (%s)%n", key, cause))
  *       .build(key -> createExpensiveGraph(key));
  * }</pre>
  * <p>
@@ -72,7 +85,7 @@ import com.github.benmanes.caffeine.cache.stats.StatsCounter;
  * are reflected in that iterator. These iterators never throw
  * {@link ConcurrentModificationException}.
  * <p>
- * <b>Note:</b> by default, the returned cache uses equality comparisons (the
+ * <b>Note:</b> By default, the returned cache uses equality comparisons (the
  * {@link Object#equals equals} method) to determine equality for keys or values. However, if
  * {@link #weakKeys} was specified, the cache uses identity ({@code ==}) comparisons instead for
  * keys. Likewise, if {@link #weakValues} or {@link #softValues} was specified, the cache uses
@@ -80,18 +93,20 @@ import com.github.benmanes.caffeine.cache.stats.StatsCounter;
  * <p>
  * Entries are automatically evicted from the cache when any of
  * {@linkplain #maximumSize(long) maximumSize}, {@linkplain #maximumWeight(long) maximumWeight},
- * {@linkplain #expireAfterWrite expireAfterWrite},
+ * {@linkplain #expireAfter(Expiry) expireAfter}, {@linkplain #expireAfterWrite expireAfterWrite},
  * {@linkplain #expireAfterAccess expireAfterAccess}, {@linkplain #weakKeys weakKeys},
  * {@linkplain #weakValues weakValues}, or {@linkplain #softValues softValues} are requested.
  * <p>
  * If {@linkplain #maximumSize(long) maximumSize} or {@linkplain #maximumWeight(long) maximumWeight}
- * is requested entries may be evicted on each cache modification.
+ * is requested, entries may be evicted on each cache modification.
  * <p>
- * If {@linkplain #expireAfterWrite expireAfterWrite} or
- * {@linkplain #expireAfterAccess expireAfterAccess} is requested entries may be evicted on each
- * cache modification, on occasional cache accesses, or on calls to {@link Cache#cleanUp}. Expired
- * entries may be counted by {@link Cache#estimatedSize()}, but will never be visible to read or
- * write operations.
+ * If {@linkplain #expireAfter(Expiry) expireAfter},
+ * {@linkplain #expireAfterWrite expireAfterWrite}, or
+ * {@linkplain #expireAfterAccess expireAfterAccess} is requested, then entries may be evicted on
+ * each cache modification, on occasional cache accesses, or on calls to {@link Cache#cleanUp}. A
+ * {@linkplain #scheduler(Scheduler)} may be specified to provide prompt removal of expired entries
+ * rather than waiting until activity triggers the periodic maintenance. Expired entries may be
+ * counted by {@link Cache#estimatedSize()}, but will never be visible to read or write operations.
  * <p>
  * If {@linkplain #weakKeys weakKeys}, {@linkplain #weakValues weakValues}, or
  * {@linkplain #softValues softValues} are requested, it is possible for a key or value present in
@@ -100,59 +115,73 @@ import com.github.benmanes.caffeine.cache.stats.StatsCounter;
  * {@link Cache#cleanUp}; such entries may be counted in {@link Cache#estimatedSize()}, but will
  * never be visible to read or write operations.
  * <p>
- * Certain cache configurations will result in the accrual of periodic maintenance tasks which
+ * Certain cache configurations will result in the accrual of periodic maintenance tasks that
  * will be performed during write operations, or during occasional read operations in the absence of
  * writes. The {@link Cache#cleanUp} method of the returned cache will also perform maintenance, but
- * calling it should not be necessary with a high throughput cache. Only caches built with
+ * calling it should not be necessary with a high-throughput cache. Only caches built with
  * {@linkplain #maximumSize maximumSize}, {@linkplain #maximumWeight maximumWeight},
- * {@linkplain #expireAfterWrite expireAfterWrite},
+ * {@linkplain #expireAfter(Expiry) expireAfter}, {@linkplain #expireAfterWrite expireAfterWrite},
  * {@linkplain #expireAfterAccess expireAfterAccess}, {@linkplain #weakKeys weakKeys},
  * {@linkplain #weakValues weakValues}, or {@linkplain #softValues softValues} perform periodic
  * maintenance.
  * <p>
  * The caches produced by {@code Caffeine} are serializable, and the deserialized caches retain all
  * the configuration properties of the original cache. Note that the serialized form does <i>not</i>
- * include cache contents, but only configuration.
+ * include cache contents but only configuration.
  *
  * @author ben.manes@gmail.com (Ben Manes)
- * @param <K> the base key type for all caches created by this builder
- * @param <V> the base value type for all caches created by this builder
+ * @param <K> the most general key type this builder will be able to create caches for. This is
+ *     normally {@code Object} unless it is constrained by using a method like {@code
+ *     #removalListener}
+ * @param <V> the most general value type this builder will be able to create caches for. This is
+ *     normally {@code Object} unless it is constrained by using a method like {@code
+ *     #removalListener}
  */
+@NullMarked
 public final class Caffeine<K, V> {
   static final Supplier<StatsCounter> ENABLED_STATS_COUNTER_SUPPLIER = ConcurrentStatsCounter::new;
+  static final Logger logger = System.getLogger(Caffeine.class.getName());
+  static final Duration MIN_DURATION = Duration.ofNanos(Long.MIN_VALUE);
+  static final Duration MAX_DURATION = Duration.ofNanos(Long.MAX_VALUE);
+  static final double DEFAULT_LOAD_FACTOR = 0.75;
 
-  enum Strength { STRONG, WEAK, SOFT }
+  enum Strength { WEAK, SOFT }
   static final int UNSET_INT = -1;
 
-  static final int DEFAULT_INITIAL_CAPACITY = 0;
+  static final int DEFAULT_INITIAL_CAPACITY = 16;
   static final int DEFAULT_EXPIRATION_NANOS = 0;
   static final int DEFAULT_REFRESH_NANOS = 0;
+
+  boolean strictParsing = true;
+  boolean interner;
 
   long maximumSize = UNSET_INT;
   long maximumWeight = UNSET_INT;
   int initialCapacity = UNSET_INT;
 
-  long refreshNanos = UNSET_INT;
   long expireAfterWriteNanos = UNSET_INT;
   long expireAfterAccessNanos = UNSET_INT;
+  long refreshAfterWriteNanos = UNSET_INT;
 
-  RemovalListener<? super K, ? super V> removalListener;
-  Supplier<StatsCounter> statsCounterSupplier;
-  CacheWriter<? super K, ? super V> writer;
-  Weigher<? super K, ? super V> weigher;
-  Supplier<String> nameSupplier;
-  Executor executor;
-  Ticker ticker;
+  @Nullable RemovalListener<? super K, ? super V> evictionListener;
+  @Nullable RemovalListener<? super K, ? super V> removalListener;
+  @Nullable Supplier<StatsCounter> statsCounterSupplier;
+  @Nullable Weigher<? super K, ? super V> weigher;
+  @Nullable Expiry<? super K, ? super V> expiry;
+  @Nullable Scheduler scheduler;
+  @Nullable Executor executor;
+  @Nullable Ticker ticker;
 
-  Strength keyStrength;
-  Strength valueStrength;
+  @Nullable Strength keyStrength;
+  @Nullable Strength valueStrength;
 
   private Caffeine() {}
 
   /** Ensures that the argument expression is true. */
-  static void requireArgument(boolean expression, String template, Object... args) {
+  @FormatMethod
+  static void requireArgument(boolean expression, String template, @Nullable Object... args) {
     if (!expression) {
-      throw new IllegalArgumentException(String.format(template, args));
+      throw new IllegalArgumentException(String.format(US, template, args));
     }
   }
 
@@ -171,35 +200,117 @@ public final class Caffeine<K, V> {
   }
 
   /** Ensures that the state expression is true. */
-  static void requireState(boolean expression, String template, Object... args) {
+  @FormatMethod
+  static void requireState(boolean expression, String template, @Nullable Object... args) {
     if (!expression) {
-      throw new IllegalStateException(String.format(template, args));
+      throw new IllegalStateException(String.format(US, template, args));
     }
+  }
+
+  /** Returns the smallest power of two greater than or equal to {@code x}. */
+  static int ceilingPowerOfTwo(int x) {
+    // From Hacker's Delight, Chapter 3, Harry S. Warren Jr.
+    return 1 << -Integer.numberOfLeadingZeros(x - 1);
+  }
+
+  /** Returns the smallest power of two greater than or equal to {@code x}. */
+  static long ceilingPowerOfTwo(long x) {
+    // From Hacker's Delight, Chapter 3, Harry S. Warren Jr.
+    return 1L << -Long.numberOfLeadingZeros(x - 1);
+  }
+
+  /**
+   * Calculate initial capacity for {@link HashMap}-based classes, from expected size and default
+   * load factor (0.75).
+   *
+   * @param numMappings the expected number of mappings
+   * @return initial capacity for HashMap based classes
+   */
+  static int calculateHashMapCapacity(int numMappings) {
+    return (int) Math.ceil(numMappings / DEFAULT_LOAD_FACTOR);
+  }
+
+  /**
+   * Calculate initial capacity for {@link HashMap}-based classes, from expected size and default
+   * load factor (0.75).
+   *
+   * @param iterable the expected number of mappings
+   * @return initial capacity for HashMap based classes
+   */
+  static int calculateHashMapCapacity(Iterable<?> iterable) {
+    return (iterable instanceof Collection)
+        ? calculateHashMapCapacity(((Collection<?>) iterable).size())
+        : DEFAULT_INITIAL_CAPACITY;
+  }
+
+  /**
+   * Returns the number of nanoseconds of the given duration without throwing or overflowing.
+   * <p>
+   * Instead of throwing {@link ArithmeticException}, this method silently saturates to either
+   * {@link Long#MAX_VALUE} or {@link Long#MIN_VALUE}. This behavior can be useful when decomposing
+   * a duration in order to call a legacy API which requires a {@code long, TimeUnit} pair.
+   */
+  static long toNanosSaturated(Duration duration) {
+    return duration.isNegative()
+        ? (duration.compareTo(MIN_DURATION) <= 0) ? Long.MIN_VALUE : duration.toNanos()
+        : (duration.compareTo(MAX_DURATION) >= 0) ? Long.MAX_VALUE : duration.toNanos();
   }
 
   /**
    * Constructs a new {@code Caffeine} instance with default settings, including strong keys, strong
    * values, and no automatic eviction of any kind.
+   * <p>
+   * Note that while this return type is {@code Caffeine<Object, Object>}, type parameters on the
+   * {@link #build} methods allow you to create a cache of any key and value type desired.
    *
    * @return a new instance with default settings
    */
-  @Nonnull
   public static Caffeine<Object, Object> newBuilder() {
-    return new Caffeine<Object, Object>();
+    return new Caffeine<>();
+  }
+
+  /** Returns a cache that is optimized for weak reference interning (see {@link Interner}). */
+  static <K> BoundedLocalCache<K, Boolean> newWeakInterner() {
+    var builder = new Caffeine<K, Boolean>().executor(Runnable::run).weakKeys();
+    builder.interner = true;
+    return LocalCacheFactory.newBoundedLocalCache(builder,
+        /* cacheLoader= */ null, /* isAsync= */ false);
   }
 
   /**
-   * Sets the minimum total size for the internal hash tables. Providing a large enough estimate at
-   * construction time avoids the need for expensive resizing operations later, but setting this
+   * Constructs a new {@code Caffeine} instance with the settings specified in {@code spec}.
+   *
+   * @param spec the specification to build from
+   * @return a new instance with the specification's settings
+   */
+  public static Caffeine<Object, Object> from(CaffeineSpec spec) {
+    Caffeine<Object, Object> builder = spec.toBuilder();
+    builder.strictParsing = false;
+    return builder;
+  }
+
+  /**
+   * Constructs a new {@code Caffeine} instance with the settings specified in {@code spec}.
+   *
+   * @param spec a String in the format specified by {@link CaffeineSpec}
+   * @return a new instance with the specification's settings
+   */
+  public static Caffeine<Object, Object> from(String spec) {
+    return from(CaffeineSpec.parse(spec));
+  }
+
+  /**
+   * Sets the minimum total size for the internal data structures. Providing a large enough estimate
+   * at construction time avoids the need for expensive resizing operations later, but setting this
    * value unnecessarily high wastes memory.
    *
-   * @param initialCapacity minimum total size for the internal hash tables
-   * @return this builder instance
+   * @param initialCapacity minimum total size for the internal data structures
+   * @return this {@code Caffeine} instance (for chaining)
    * @throws IllegalArgumentException if {@code initialCapacity} is negative
    * @throws IllegalStateException if an initial capacity was already set
    */
-  @Nonnull
-  public Caffeine<K, V> initialCapacity(@Nonnegative int initialCapacity) {
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> initialCapacity(int initialCapacity) {
     requireState(this.initialCapacity == UNSET_INT,
         "initial capacity was already set to %s", this.initialCapacity);
     requireArgument(initialCapacity >= 0);
@@ -207,57 +318,97 @@ public final class Caffeine<K, V> {
     return this;
   }
 
+  boolean hasInitialCapacity() {
+    return (initialCapacity != UNSET_INT);
+  }
+
   int getInitialCapacity() {
-    return (initialCapacity == UNSET_INT) ? DEFAULT_INITIAL_CAPACITY : initialCapacity;
+    return hasInitialCapacity() ? initialCapacity : DEFAULT_INITIAL_CAPACITY;
   }
 
   /**
    * Specifies the executor to use when running asynchronous tasks. The executor is delegated to
    * when sending removal notifications, when asynchronous computations are performed by
-   * {@link AsyncLoadingCache} and {@link LoadingCache#refresh}, or when performing periodic
-   * maintenance. By default, {@link ForkJoinPool#commonPool()} is used.
+   * {@link AsyncCache} or {@link LoadingCache#refresh} or {@link #refreshAfterWrite}, or when
+   * performing periodic maintenance. By default, {@link ForkJoinPool#commonPool()} is used.
    * <p>
-   * The primary intent of this method is to facilitate testing of caches which have been
-   * configured with {@link #removalListener} or utilize asynchronous computations. A test may
-   * instead prefer to configure the cache to execute tasks directly on the same thread.
+   * The primary intent of this method is to facilitate testing of caches which have been configured
+   * with {@link #removalListener} or utilize asynchronous computations. A test may instead prefer
+   * to configure the cache to execute tasks directly on the same thread.
    * <p>
-   * Beware that configuring a cache with an executor that throws {@link RejectedExecutionException}
-   * may experience non-deterministic behavior.
+   * Beware that configuring a cache with an executor that discards tasks or never runs them may
+   * experience non-deterministic behavior.
    *
    * @param executor the executor to use for asynchronous execution
-   * @return this builder instance
+   * @return this {@code Caffeine} instance (for chaining)
    * @throws NullPointerException if the specified executor is null
    */
-  @Nonnull
-  public Caffeine<K, V> executor(@Nonnull Executor executor) {
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> executor(Executor executor) {
     requireState(this.executor == null, "executor was already set to %s", this.executor);
     this.executor = requireNonNull(executor);
     return this;
   }
 
-  @Nonnull
   Executor getExecutor() {
     return (executor == null) ? ForkJoinPool.commonPool() : executor;
   }
 
   /**
-   * Specifies the maximum number of entries the cache may contain. Note that the cache <b>may evict
-   * an entry before this limit is exceeded</b>. As the cache size grows close to the maximum, the
-   * cache evicts entries that are less likely to be used again. For example, the cache may evict an
-   * entry because it hasn't been used recently or very often.
+   * Specifies the scheduler to use when scheduling routine maintenance based on an expiration
+   * event. This augments the periodic maintenance that occurs during normal cache operations to
+   * allow for the prompt removal of expired entries regardless of whether any cache activity is
+   * occurring at that time. By default, {@link Scheduler#disabledScheduler()} is used.
    * <p>
-   * When {@code size} is zero, elements will be evicted immediately after being loaded into the
-   * cache. This can be useful in testing, or to disable caching temporarily without a code change.
+   * The scheduling between expiration events is paced to exploit batching and to minimize
+   * executions in short succession. This minimum difference between the scheduled executions is
+   * implementation-specific, currently at ~1 second (2^30 ns). In addition, the provided scheduler
+   * may not offer real-time guarantees (including {@link ScheduledThreadPoolExecutor}). The
+   * scheduling is best-effort and does not make any hard guarantees of when an expired entry will
+   * be removed.
+   *
+   * @param scheduler the scheduler that submits a task to the {@link #executor(Executor)} after a
+   *        given delay
+   * @return this {@code Caffeine} instance (for chaining)
+   * @throws NullPointerException if the specified scheduler is null
+   */
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> scheduler(Scheduler scheduler) {
+    requireState(this.scheduler == null, "scheduler was already set to %s", this.scheduler);
+    this.scheduler = requireNonNull(scheduler);
+    return this;
+  }
+
+  Scheduler getScheduler() {
+    if ((scheduler == null) || (scheduler == Scheduler.disabledScheduler())) {
+      return Scheduler.disabledScheduler();
+    } else if (scheduler == Scheduler.systemScheduler()) {
+      return scheduler;
+    }
+    return Scheduler.guardedScheduler(scheduler);
+  }
+
+  /**
+   * Specifies the maximum number of entries the cache may contain. Note that the cache <b>may evict
+   * an entry before this limit is exceeded or temporarily exceed the threshold while evicting</b>.
+   * As the cache size grows close to the maximum, the cache evicts entries that are less likely to
+   * be used again. For example, the cache may evict an entry because it hasn't been used recently
+   * or very often.
+   * <p>
+   * When {@code maximumSize} is zero, elements will be evicted immediately after being loaded into
+   * the cache. This can be useful in testing, or to disable caching temporarily without a code
+   * change. As eviction is scheduled on the configured {@link #executor}, tests may instead prefer
+   * to configure the cache to execute tasks directly on the same thread.
    * <p>
    * This feature cannot be used in conjunction with {@link #maximumWeight}.
    *
    * @param maximumSize the maximum size of the cache
-   * @return this builder instance
-   * @throws IllegalArgumentException if {@code size} is negative
+   * @return this {@code Caffeine} instance (for chaining)
+   * @throws IllegalArgumentException if {@code maximumSize} is negative
    * @throws IllegalStateException if a maximum size or weight was already set
    */
-  @Nonnull
-  public Caffeine<K, V> maximumSize(@Nonnegative long maximumSize) {
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> maximumSize(long maximumSize) {
     requireState(this.maximumSize == UNSET_INT,
         "maximum size was already set to %s", this.maximumSize);
     requireState(this.maximumWeight == UNSET_INT,
@@ -273,12 +424,15 @@ public final class Caffeine<K, V> {
    * {@link Weigher} specified with {@link #weigher}, and use of this method requires a
    * corresponding call to {@link #weigher} prior to calling {@link #build}.
    * <p>
-   * Note that the cache <b>may evict an entry before this limit is exceeded</b>. As the cache size
-   * grows close to the maximum, the cache evicts entries that are less likely to be used again. For
-   * example, the cache may evict an entry because it hasn't been used recently or very often.
+   * Note that the cache <b>may evict an entry before this limit is exceeded or temporarily exceed
+   * the threshold while evicting</b>. As the cache size grows close to the maximum, the cache
+   * evicts entries that are less likely to be used again. For example, the cache may evict an entry
+   * because it hasn't been used recently or very often.
    * <p>
-   * When {@code weight} is zero, elements will be evicted immediately after being loaded into
-   * cache. This can be useful in testing, or to disable caching temporarily without a code change.
+   * When {@code maximumWeight} is zero, elements will be evicted immediately after being loaded
+   * into the cache. This can be useful in testing, or to disable caching temporarily without a code
+   * change. As eviction is scheduled on the configured {@link #executor}, tests may instead prefer
+   * to configure the cache to execute tasks directly on the same thread.
    * <p>
    * Note that weight is only used to determine whether the cache is over capacity; it has no effect
    * on selecting which entry should be evicted next.
@@ -286,18 +440,18 @@ public final class Caffeine<K, V> {
    * This feature cannot be used in conjunction with {@link #maximumSize}.
    *
    * @param maximumWeight the maximum total weight of entries the cache may contain
-   * @return this builder instance
-   * @throws IllegalArgumentException if {@code weight} is negative
+   * @return this {@code Caffeine} instance (for chaining)
+   * @throws IllegalArgumentException if {@code maximumWeight} is negative
    * @throws IllegalStateException if a maximum weight or size was already set
    */
-  @Nonnull
-  public Caffeine<K, V> maximumWeight(@Nonnegative long maximumWeight) {
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> maximumWeight(long maximumWeight) {
     requireState(this.maximumWeight == UNSET_INT,
         "maximum weight was already set to %s", this.maximumWeight);
     requireState(this.maximumSize == UNSET_INT,
         "maximum size was already set to %s", this.maximumSize);
-    this.maximumWeight = maximumWeight;
     requireArgument(maximumWeight >= 0, "maximum weight must not be negative");
+    this.maximumWeight = maximumWeight;
     return this;
   }
 
@@ -305,8 +459,8 @@ public final class Caffeine<K, V> {
    * Specifies the weigher to use in determining the weight of entries. Entry weight is taken into
    * consideration by {@link #maximumWeight(long)} when determining which entries to evict, and use
    * of this method requires a corresponding call to {@link #maximumWeight(long)} prior to calling
-   * {@link #build}. Weights are measured and recorded when entries are inserted into the cache, and
-   * are thus effectively static during the lifetime of a cache entry.
+   * {@link #build}. Weights are measured and recorded when entries are inserted into or updated in
+   * the cache, and are thus effectively static during the lifetime of a cache entry.
    * <p>
    * When the weight of an entry is zero it will not be considered for size-based eviction (though
    * it still may be evicted by other means).
@@ -329,41 +483,40 @@ public final class Caffeine<K, V> {
    * @param <V1> value type of the weigher
    * @return the cache builder reference that should be used instead of {@code this} for any
    *         remaining configuration and cache building
-   * @throws IllegalArgumentException if {@code size} is negative
-   * @throws IllegalStateException if a maximum size was already set
+   * @throws IllegalStateException if a weigher was already set
    */
-  @Nonnull
+  @CanIgnoreReturnValue
   public <K1 extends K, V1 extends V> Caffeine<K1, V1> weigher(
-      @Nonnull Weigher<? super K1, ? super V1> weigher) {
+      Weigher<? super K1, ? super V1> weigher) {
     requireNonNull(weigher);
     requireState(this.weigher == null, "weigher was already set to %s", this.weigher);
-    requireState(this.maximumSize == UNSET_INT,
-        "weigher can not be combined with maximum size", this.maximumSize);
+    requireState(!strictParsing || this.maximumSize == UNSET_INT,
+        "weigher can not be combined with maximum size");
+
     @SuppressWarnings("unchecked")
-    Caffeine<K1, V1> self = (Caffeine<K1, V1>) this;
+    var self = (Caffeine<K1, V1>) this;
     self.weigher = weigher;
     return self;
   }
 
   boolean evicts() {
-    return getMaximumWeight() != UNSET_INT;
+    return getMaximum() != UNSET_INT;
   }
 
   boolean isWeighted() {
     return (weigher != null);
   }
 
-  @Nonnegative
-  long getMaximumWeight() {
-    return (weigher == null) ? maximumSize : maximumWeight;
+  long getMaximum() {
+    return isWeighted() ? maximumWeight : maximumSize;
   }
 
-  @Nonnull @SuppressWarnings("unchecked")
+  @SuppressWarnings({"JavaAnnotator", "unchecked"})
   <K1 extends K, V1 extends V> Weigher<K1, V1> getWeigher(boolean isAsync) {
-    Weigher<K1, V1> delegate = isWeighted() && (weigher != Weigher.singletonWeigher())
-        ? Weigher.boundedWeigher((Weigher<K1, V1>) weigher)
-        : Weigher.singletonWeigher();
-    return (Weigher<K1, V1>) (isAsync ? new AsyncWeigher<>(delegate) : delegate);
+    Weigher<K1, V1> delegate = (weigher == null) || (weigher == Weigher.singletonWeigher())
+        ? Weigher.singletonWeigher()
+        : Weigher.boundedWeigher((Weigher<K1, V1>) weigher);
+    return isAsync ? (Weigher<K1, V1>) new AsyncWeigher<>(delegate) : delegate;
   }
 
   /**
@@ -371,32 +524,29 @@ public final class Caffeine<K, V> {
    * {@link WeakReference} (by default, strong references are used).
    * <p>
    * <b>Warning:</b> when this method is used, the resulting cache will use identity ({@code ==})
-   * comparison to determine equality of keys.
+   * comparison to determine equality of keys. Its {@link Cache#asMap} view will therefore
+   * technically violate the {@link Map} specification (in the same way that {@link IdentityHashMap}
+   * does).
    * <p>
    * Entries with keys that have been garbage collected may be counted in
    * {@link Cache#estimatedSize()}, but will never be visible to read or write operations; such
    * entries are cleaned up as part of the routine maintenance described in the class javadoc.
    * <p>
-   * This feature cannot be used in conjunction with {@link #writer}.
+   * This feature cannot be used in conjunction when {@link #evictionListener(RemovalListener)} is
+   * combined with {@link #buildAsync}.
    *
-   * @return this builder instance
-   * @throws IllegalStateException if the key strength was already set or the writer was set
+   * @return this {@code Caffeine} instance (for chaining)
+   * @throws IllegalStateException if the key strength was already set
    */
-  @Nonnull
+  @CanIgnoreReturnValue
   public Caffeine<K, V> weakKeys() {
     requireState(keyStrength == null, "Key strength was already set to %s", keyStrength);
-    requireState(writer == null, "Weak keys may not be used with CacheWriter");
-
     keyStrength = Strength.WEAK;
     return this;
   }
 
   boolean isStrongKeys() {
     return (keyStrength == null);
-  }
-
-  boolean isWeakKeys() {
-    return (keyStrength == Strength.WEAK);
   }
 
   /**
@@ -415,10 +565,10 @@ public final class Caffeine<K, V> {
    * <p>
    * This feature cannot be used in conjunction with {@link #buildAsync}.
    *
-   * @return this builder instance
+   * @return this {@code Caffeine} instance (for chaining)
    * @throws IllegalStateException if the value strength was already set
    */
-  @Nonnull
+  @CanIgnoreReturnValue
   public Caffeine<K, V> weakValues() {
     requireState(valueStrength == null, "Value strength was already set to %s", valueStrength);
     valueStrength = Strength.WEAK;
@@ -433,10 +583,6 @@ public final class Caffeine<K, V> {
     return (valueStrength == Strength.WEAK);
   }
 
-  boolean isSoftValues() {
-    return (valueStrength == Strength.SOFT);
-  }
-
   /**
    * Specifies that each value (not key) stored in the cache should be wrapped in a
    * {@link SoftReference} (by default, strong references are used). Softly-referenced objects will
@@ -445,7 +591,7 @@ public final class Caffeine<K, V> {
    * <p>
    * <b>Warning:</b> in most circumstances it is better to set a per-cache
    * {@linkplain #maximumSize(long) maximum size} instead of using soft references. You should only
-   * use this method if you are well familiar with the practical consequences of soft references.
+   * use this method if you are very familiar with the practical consequences of soft references.
    * <p>
    * <b>Note:</b> when this method is used, the resulting cache will use identity ({@code ==})
    * comparison to determine equality of values.
@@ -456,10 +602,10 @@ public final class Caffeine<K, V> {
    * <p>
    * This feature cannot be used in conjunction with {@link #buildAsync}.
    *
-   * @return this builder instance
+   * @return this {@code Caffeine} instance (for chaining)
    * @throws IllegalStateException if the value strength was already set
    */
-  @Nonnull
+  @CanIgnoreReturnValue
   public Caffeine<K, V> softValues() {
     requireState(valueStrength == null, "Value strength was already set to %s", valueStrength);
     valueStrength = Strength.SOFT;
@@ -472,25 +618,50 @@ public final class Caffeine<K, V> {
    * <p>
    * Expired entries may be counted in {@link Cache#estimatedSize()}, but will never be visible to
    * read or write operations. Expired entries are cleaned up as part of the routine maintenance
-   * described in the class javadoc.
+   * described in the class javadoc. A {@link #scheduler(Scheduler)} may be configured for a prompt
+   * removal of expired entries.
    *
-   * @param duration the length of time after an entry is created that it should be automatically
-   *        removed
-   * @param unit the unit that {@code duration} is expressed in
-   * @return this builder instance
+   * @param duration the length of time after an entry is created or updated before it should be
+   *        automatically removed
+   * @return this {@code Caffeine} instance (for chaining)
    * @throws IllegalArgumentException if {@code duration} is negative
-   * @throws IllegalStateException if the time to live or time to idle was already set
+   * @throws IllegalStateException if the time to live or variable expiration was already set
+   * @throws ArithmeticException for durations greater than +/- approximately 292 years
    */
-  @Nonnull
-  public Caffeine<K, V> expireAfterWrite(@Nonnegative long duration, @Nonnull TimeUnit unit) {
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> expireAfterWrite(Duration duration) {
+    return expireAfterWrite(toNanosSaturated(duration), TimeUnit.NANOSECONDS);
+  }
+
+  /**
+   * Specifies that each entry should be automatically removed from the cache once a fixed duration
+   * has elapsed after the entry's creation, or the most recent replacement of its value.
+   * <p>
+   * Expired entries may be counted in {@link Cache#estimatedSize()}, but will never be visible to
+   * read or write operations. Expired entries are cleaned up as part of the routine maintenance
+   * described in the class javadoc. A {@link #scheduler(Scheduler)} may be configured for a prompt
+   * removal of expired entries.
+   * <p>
+   * If you can represent the duration as a {@link java.time.Duration} (which should be preferred
+   * when feasible), use {@link #expireAfterWrite(Duration)} instead.
+   *
+   * @param duration the length of time after an entry is created or updated before it should be
+   *        automatically removed
+   * @param unit the unit that {@code duration} is expressed in
+   * @return this {@code Caffeine} instance (for chaining)
+   * @throws IllegalArgumentException if {@code duration} is negative
+   * @throws IllegalStateException if the time to live or variable expiration was already set
+   */
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> expireAfterWrite(long duration, TimeUnit unit) {
     requireState(expireAfterWriteNanos == UNSET_INT,
         "expireAfterWrite was already set to %s ns", expireAfterWriteNanos);
+    requireState(expiry == null, "expireAfterWrite may not be used with variable expiration");
     requireArgument(duration >= 0, "duration cannot be negative: %s %s", duration, unit);
     this.expireAfterWriteNanos = unit.toNanos(duration);
     return this;
   }
 
-  @Nonnegative
   long getExpiresAfterWriteNanos() {
     return expiresAfterWrite() ? expireAfterWriteNanos : DEFAULT_EXPIRATION_NANOS;
   }
@@ -502,31 +673,59 @@ public final class Caffeine<K, V> {
   /**
    * Specifies that each entry should be automatically removed from the cache once a fixed duration
    * has elapsed after the entry's creation, the most recent replacement of its value, or its last
+   * access. Access time is reset by all cache read and write operations (including {@code
+   * Cache.asMap().get(Object)} and {@code Cache.asMap().put(K, V)}), but not by operations on the
+   * collection-views of {@link Cache#asMap}.
+   * <p>
+   * Expired entries may be counted in {@link Cache#estimatedSize()}, but will never be visible to
+   * read or write operations. Expired entries are cleaned up as part of the routine maintenance
+   * described in the class javadoc. A {@link #scheduler(Scheduler)} may be configured for a prompt
+   * removal of expired entries.
+   *
+   * @param duration the length of time after an entry is last accessed before it should be
+   *        automatically removed
+   * @return this {@code Caffeine} instance (for chaining)
+   * @throws IllegalArgumentException if {@code duration} is negative
+   * @throws IllegalStateException if the time to idle or variable expiration was already set
+   * @throws ArithmeticException for durations greater than +/- approximately 292 years
+   */
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> expireAfterAccess(Duration duration) {
+    return expireAfterAccess(toNanosSaturated(duration), TimeUnit.NANOSECONDS);
+  }
+
+  /**
+   * Specifies that each entry should be automatically removed from the cache once a fixed duration
+   * has elapsed after the entry's creation, the most recent replacement of its value, or its last
    * read. Access time is reset by all cache read and write operations (including
    * {@code Cache.asMap().get(Object)} and {@code Cache.asMap().put(K, V)}), but not by operations
    * on the collection-views of {@link Cache#asMap}.
    * <p>
    * Expired entries may be counted in {@link Cache#estimatedSize()}, but will never be visible to
    * read or write operations. Expired entries are cleaned up as part of the routine maintenance
-   * described in the class javadoc.
+   * described in the class javadoc. A {@link #scheduler(Scheduler)} may be configured for a prompt
+   * removal of expired entries.
+   * <p>
+   * If you can represent the duration as a {@link java.time.Duration} (which should be preferred
+   * when feasible), use {@link #expireAfterAccess(Duration)} instead.
    *
-   * @param duration the length of time after an entry is last accessed that it should be
+   * @param duration the length of time after an entry is last accessed before it should be
    *        automatically removed
    * @param unit the unit that {@code duration} is expressed in
-   * @return this builder instance
+   * @return this {@code Caffeine} instance (for chaining)
    * @throws IllegalArgumentException if {@code duration} is negative
-   * @throws IllegalStateException if the time to idle or time to live was already set
+   * @throws IllegalStateException if the time to idle or variable expiration was already set
    */
-  @Nonnull
-  public Caffeine<K, V> expireAfterAccess(@Nonnegative long duration, @Nonnull TimeUnit unit) {
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> expireAfterAccess(long duration, TimeUnit unit) {
     requireState(expireAfterAccessNanos == UNSET_INT,
         "expireAfterAccess was already set to %s ns", expireAfterAccessNanos);
+    requireState(expiry == null, "expireAfterAccess may not be used with variable expiration");
     requireArgument(duration >= 0, "duration cannot be negative: %s %s", duration, unit);
     this.expireAfterAccessNanos = unit.toNanos(duration);
     return this;
   }
 
-  @Nonnegative
   long getExpiresAfterAccessNanos() {
     return expiresAfterAccess() ? expireAfterAccessNanos : DEFAULT_EXPIRATION_NANOS;
   }
@@ -536,40 +735,123 @@ public final class Caffeine<K, V> {
   }
 
   /**
+   * Specifies that each entry should be automatically removed from the cache once a duration has
+   * elapsed after the entry's creation, the most recent replacement of its value, or its last
+   * read. The expiration time is reset by all cache read and write operations (including
+   * {@code Cache.asMap().get(Object)} and {@code Cache.asMap().put(K, V)}), but not by operations
+   * on the collection-views of {@link Cache#asMap}.
+   * <p>
+   * Expired entries may be counted in {@link Cache#estimatedSize()}, but will never be visible to
+   * read or write operations. Expired entries are cleaned up as part of the routine maintenance
+   * described in the class javadoc. A {@link #scheduler(Scheduler)} may be configured for a prompt
+   * removal of expired entries.
+   * <p>
+   * <b>Important note:</b> after invoking this method, do not continue to use <i>this</i> cache
+   * builder reference; instead use the reference this method <i>returns</i>. At runtime, these
+   * point to the same instance, but only the returned reference has the correct generic type
+   * information so as to ensure type safety. For best results, use the standard method-chaining
+   * idiom illustrated in the class documentation above, configuring a builder and building your
+   * cache in a single statement. Failure to heed this advice can result in a
+   * {@link ClassCastException} being thrown by a cache operation at some <i>undefined</i> point in
+   * the future.
+   *
+   * @param expiry the expiry to use in calculating the expiration time of cache entries
+   * @param <K1> key type of the expiry
+   * @param <V1> value type of the expiry
+   * @return this {@code Caffeine} instance (for chaining)
+   * @throws IllegalStateException if expiration was already set
+   */
+  @CanIgnoreReturnValue
+  public <K1 extends K, V1 extends V> Caffeine<K1, V1> expireAfter(
+      Expiry<? super K1, ? super V1> expiry) {
+    requireNonNull(expiry);
+    requireState(this.expiry == null, "Expiry was already set to %s", this.expiry);
+    requireState(this.expireAfterAccessNanos == UNSET_INT,
+        "Expiry may not be used with expiresAfterAccess");
+    requireState(this.expireAfterWriteNanos == UNSET_INT,
+        "Expiry may not be used with expiresAfterWrite");
+
+    @SuppressWarnings("unchecked")
+    var self = (Caffeine<K1, V1>) this;
+    self.expiry = expiry;
+    return self;
+  }
+
+  boolean expiresVariable() {
+    return expiry != null;
+  }
+
+  @SuppressWarnings("unchecked")
+  @Nullable Expiry<K, V> getExpiry(boolean isAsync) {
+    return isAsync && (expiry != null)
+        ? (Expiry<K, V>) new AsyncExpiry<>(expiry)
+        : (Expiry<K, V>) expiry;
+  }
+
+  /**
    * Specifies that active entries are eligible for automatic refresh once a fixed duration has
    * elapsed after the entry's creation, or the most recent replacement of its value. The semantics
    * of refreshes are specified in {@link LoadingCache#refresh}, and are performed by calling
-   * {@link CacheLoader#reload}.
+   * {@link AsyncCacheLoader#asyncLoad}.
    * <p>
    * Automatic refreshes are performed when the first stale request for an entry occurs. The request
-   * triggering refresh will make an asynchronous call to {@link CacheLoader#reload} and immediately
-   * return the old value.
+   * triggering the refresh will make a synchronous call to {@link AsyncCacheLoader#asyncLoad} to
+   * obtain a future of the new value. If the returned future is already complete, it is returned
+   * immediately. Otherwise, the old value is returned.
    * <p>
    * <b>Note:</b> <i>all exceptions thrown during refresh will be logged and then swallowed</i>.
    *
    * @param duration the length of time after an entry is created that it should be considered
+   *     stale, and thus eligible for refresh
+   * @return this {@code Caffeine} instance (for chaining)
+   * @throws IllegalArgumentException if {@code duration} is zero or negative
+   * @throws IllegalStateException if the refresh interval was already set
+   * @throws ArithmeticException for durations greater than +/- approximately 292 years
+   */
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> refreshAfterWrite(Duration duration) {
+    return refreshAfterWrite(toNanosSaturated(duration), TimeUnit.NANOSECONDS);
+  }
+
+  /**
+   * Specifies that active entries are eligible for automatic refresh once a fixed duration has
+   * elapsed after the entry's creation, or the most recent replacement of its value. The semantics
+   * of refreshes are specified in {@link LoadingCache#refresh}, and are performed by calling
+   * {@link AsyncCacheLoader#asyncLoad}.
+   * <p>
+   * Automatic refreshes are performed when the first stale request for an entry occurs. The request
+   * triggering the refresh will make a synchronous call to {@link AsyncCacheLoader#asyncLoad} to
+   * obtain a future of the new value. If the returned future is already complete, it is returned
+   * immediately. Otherwise, the old value is returned.
+   * <p>
+   * <b>Note:</b> <i>all exceptions thrown during refresh will be logged and then swallowed</i>.
+   * <p>
+   * If you can represent the duration as a {@link java.time.Duration} (which should be preferred
+   * when feasible), use {@link #refreshAfterWrite(Duration)} instead.
+   *
+   * @param duration the length of time after an entry is created that it should be considered
    *        stale, and thus eligible for refresh
    * @param unit the unit that {@code duration} is expressed in
-   * @return this builder instance
-   * @throws IllegalArgumentException if {@code duration} is negative
+   * @return this {@code Caffeine} instance (for chaining)
+   * @throws IllegalArgumentException if {@code duration} is zero or negative
    * @throws IllegalStateException if the refresh interval was already set
    */
-  @Nonnull
-  public Caffeine<K, V> refreshAfterWrite(@Nonnegative long duration, @Nonnull TimeUnit unit) {
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> refreshAfterWrite(long duration, TimeUnit unit) {
     requireNonNull(unit);
-    requireState(refreshNanos == UNSET_INT, "refresh was already set to %s ns", refreshNanos);
+    requireState(refreshAfterWriteNanos == UNSET_INT,
+        "refreshAfterWriteNanos was already set to %s ns", refreshAfterWriteNanos);
     requireArgument(duration > 0, "duration must be positive: %s %s", duration, unit);
-    this.refreshNanos = unit.toNanos(duration);
+    this.refreshAfterWriteNanos = unit.toNanos(duration);
     return this;
   }
 
-  @Nonnegative
-  long getRefreshAfterWriteNanos() {
-    return refreshes() ? refreshNanos : DEFAULT_REFRESH_NANOS;
+  boolean refreshAfterWrite() {
+    return refreshAfterWriteNanos != UNSET_INT;
   }
 
-  boolean refreshes() {
-    return refreshNanos != UNSET_INT;
+  long getRefreshAfterWriteNanos() {
+    return refreshAfterWrite() ? refreshAfterWriteNanos : DEFAULT_REFRESH_NANOS;
   }
 
   /**
@@ -577,42 +859,105 @@ public final class Caffeine<K, V> {
    * expired or refreshed. By default, {@link System#nanoTime} is used.
    * <p>
    * The primary intent of this method is to facilitate testing of caches which have been configured
-   * with {@link #expireAfterWrite}, {@link #expireAfterAccess}, or {@link #refreshAfterWrite}.
+   * with {@link #expireAfterWrite}, {@link #expireAfterAccess}, or {@link #refreshAfterWrite}. Note
+   * that this ticker is not used when recording statistics.
    *
    * @param ticker a nanosecond-precision time source
-   * @return this builder instance
+   * @return this {@code Caffeine} instance (for chaining)
    * @throws IllegalStateException if a ticker was already set
    * @throws NullPointerException if the specified ticker is null
    */
-  @Nonnull
-  public Caffeine<K, V> ticker(@Nonnull Ticker ticker) {
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> ticker(Ticker ticker) {
     requireState(this.ticker == null, "Ticker was already set to %s", this.ticker);
     this.ticker = requireNonNull(ticker);
     return this;
   }
 
-  @Nonnull
   Ticker getTicker() {
-    return expiresAfterAccess() || expiresAfterWrite() || refreshes() || isRecordingStats()
+    boolean useTicker = expiresVariable() || expiresAfterAccess()
+        || expiresAfterWrite() || refreshAfterWrite();
+    return useTicker
         ? (ticker == null) ? Ticker.systemTicker() : ticker
         : Ticker.disabledTicker();
   }
 
   /**
+   * Specifies a listener instance that caches should notify each time an entry is evicted. The
+   * cache will invoke this listener during the atomic operation to remove the entry. In the case of
+   * expiration or reference collection, the entry may be pending removal and will be discarded as
+   * part of the routine maintenance described in the class documentation above. For a more prompt
+   * notification on expiration a {@link #scheduler(Scheduler)} may be configured. A
+   * {@link #removalListener(RemovalListener)} may be preferred when the listener should be invoked
+   * for any {@linkplain RemovalCause reason}, be performed outside of the atomic operation to
+   * remove the entry, or be delegated to the configured {@link #executor(Executor)}.
+   * <p>
+   * <b>Important note:</b> after invoking this method, do not continue to use <i>this</i> cache
+   * builder reference; instead use the reference this method <i>returns</i>. At runtime, these
+   * point to the same instance, but only the returned reference has the correct generic type
+   * information so as to ensure type safety. For best results, use the standard method-chaining
+   * idiom illustrated in the class documentation above, configuring a builder and building your
+   * cache in a single statement. Failure to heed this advice can result in a
+   * {@link ClassCastException} being thrown by a cache operation at some <i>undefined</i> point in
+   * the future.
+   * <p>
+   * <b>Warning:</b> any exception thrown by {@code evictionListener} will <i>not</i> be propagated
+   * to the {@code Cache} user, only logged via a {@link Logger}.
+   * <p>
+   * This feature cannot be used in conjunction when {@link #weakKeys()} is combined with
+   * {@link #buildAsync}.
+   *
+   * @param evictionListener a listener instance that caches should notify each time an entry is
+   *        being automatically removed due to eviction
+   * @param <K1> the key type of the listener
+   * @param <V1> the value type of the listener
+   * @return the cache builder reference that should be used instead of {@code this} for any
+   *         remaining configuration and cache building
+   * @throws IllegalStateException if a removal listener was already set
+   * @throws NullPointerException if the specified removal listener is null
+   */
+  @CanIgnoreReturnValue
+  public <K1 extends K, V1 extends V> Caffeine<K1, V1> evictionListener(
+      RemovalListener<? super K1, ? super V1> evictionListener) {
+    requireState(this.evictionListener == null,
+        "eviction listener was already set to %s", this.evictionListener);
+
+    @SuppressWarnings("unchecked")
+    var self = (Caffeine<K1, V1>) this;
+    self.evictionListener = requireNonNull(evictionListener);
+    return self;
+  }
+
+  @SuppressWarnings({"JavaAnnotator", "unchecked"})
+  <K1 extends K, V1 extends V> @Nullable RemovalListener<K1, V1> getEvictionListener(
+      boolean async) {
+    var castedListener = (RemovalListener<K1, V1>) evictionListener;
+    return async && (castedListener != null)
+        ? (RemovalListener<K1, V1>) new AsyncEvictionListener<>(castedListener)
+        : castedListener;
+  }
+
+  /**
    * Specifies a listener instance that caches should notify each time an entry is removed for any
-   * {@linkplain RemovalCause reason}. Each cache created by this builder will invoke this listener
-   * as part of the routine maintenance described in the class documentation above.
+   * {@linkplain RemovalCause reason}. The cache will invoke this listener on the configured
+   * {@link #executor(Executor)} after the entry's removal operation has completed. In the case of
+   * expiration or reference collection, the entry may be pending removal and will be discarded as
+   * part of the routine maintenance described in the class documentation above. For a more prompt
+   * notification on expiration a {@link #scheduler(Scheduler)} may be configured. An
+   * {@link #evictionListener(RemovalListener)} may be preferred when the listener should be invoked
+   * as part of the atomic operation to remove the entry.
    * <p>
-   * <b>Warning:</b> after invoking this method, do not continue to use <i>this</i> cache builder
-   * reference; instead use the reference this method <i>returns</i>. At runtime, these point to the
-   * same instance, but only the returned reference has the correct generic type information so as
-   * to ensure type safety. For best results, use the standard method-chaining idiom illustrated in
-   * the class documentation above, configuring a builder and building your cache in a single
-   * statement. Failure to heed this advice can result in a {@link ClassCastException} being thrown
-   * by a cache operation at some <i>undefined</i> point in the future.
+   * <b>Important note:</b> after invoking this method, do not continue to use <i>this</i> cache
+   * builder reference; instead use the reference this method <i>returns</i>. At runtime, these
+   * point to the same instance, but only the returned reference has the correct generic type
+   * information so as to ensure type safety. For best results, use the standard method-chaining
+   * idiom illustrated in the class documentation above, configuring a builder and building your
+   * cache in a single statement. Failure to heed this advice can result in a
+   * {@link ClassCastException} being thrown by a cache operation at some <i>undefined</i> point in
+   * the future.
    * <p>
-   * <b>Warning:</b> any exception thrown by {@code listener} will <i>not</i> be propagated to the
-   * {@code Cache} user, only logged via a {@link Logger}.
+   * <b>Warning:</b> any exception thrown by {@code removalListener} will <i>not</i> be propagated
+   * to the {@code Cache} user, only logged via a {@link Logger}.
    *
    * @param removalListener a listener instance that caches should notify each time an entry is
    *        removed
@@ -623,84 +968,35 @@ public final class Caffeine<K, V> {
    * @throws IllegalStateException if a removal listener was already set
    * @throws NullPointerException if the specified removal listener is null
    */
-  @Nonnull
+  @CanIgnoreReturnValue
   public <K1 extends K, V1 extends V> Caffeine<K1, V1> removalListener(
-      @Nonnull RemovalListener<? super K1, ? super V1> removalListener) {
-    requireState(this.removalListener == null);
+      RemovalListener<? super K1, ? super V1> removalListener) {
+    requireState(this.removalListener == null,
+        "removal listener was already set to %s", this.removalListener);
 
     @SuppressWarnings("unchecked")
-    Caffeine<K1, V1> self = (Caffeine<K1, V1>) this;
+    var self = (Caffeine<K1, V1>) this;
     self.removalListener = requireNonNull(removalListener);
     return self;
   }
 
-  <K1 extends K, V1 extends V> RemovalListener<K1, V1> getRemovalListener(boolean async) {
-    @SuppressWarnings("unchecked")
-    RemovalListener<K1, V1> castedListener = (RemovalListener<K1, V1>) removalListener;
-    if (async && (castedListener != null)) {
-      @SuppressWarnings("unchecked")
-      RemovalListener<K1, V1> asyncListener = (RemovalListener<K1, V1>)
-          new AsyncRemovalListener<K1, V1>(castedListener, getExecutor());
-      return asyncListener;
-    }
-    return castedListener;
-  }
-
-  /**
-   * Specifies a writer instance that caches should notify each time an entry is explicitly created
-   * or modified, or removed for any {@linkplain RemovalCause reason}. The writer is not notified
-   * when an entry is loaded or computed. Each cache created by this builder will invoke this writer
-   * as part of the atomic operation that modifies the cache.
-   * <p>
-   * <b>Warning:</b> after invoking this method, do not continue to use <i>this</i> cache builder
-   * reference; instead use the reference this method <i>returns</i>. At runtime, these point to the
-   * same instance, but only the returned reference has the correct generic type information so as
-   * to ensure type safety. For best results, use the standard method-chaining idiom illustrated in
-   * the class documentation above, configuring a builder and building your cache in a single
-   * statement. Failure to heed this advice can result in a {@link ClassCastException} being thrown
-   * by a cache operation at some <i>undefined</i> point in the future.
-   * <p>
-   * <b>Warning:</b> any exception thrown by {@code writer} will be propagated to the {@code Cache}
-   * user.
-   * <p>
-   * This feature cannot be used in conjunction with {@link #weakKeys()} or {@link #buildAsync}.
-   *
-   * @param writer a writer instance that caches should notify each time an entry is explicitly
-   *        created or modified, or removed for any reason
-   * @param <K1> the key type of the writer
-   * @param <V1> the value type of the writer
-   * @return the cache builder reference that should be used instead of {@code this} for any
-   *         remaining configuration and cache building
-   * @throws IllegalStateException if a writer was already set or if the key strength is weak
-   * @throws NullPointerException if the specified writer is null
-   */
-  @Nonnull
-  public <K1 extends K, V1 extends V> Caffeine<K1, V1> writer(
-      @Nonnull CacheWriter<? super K1, ? super V1> writer) {
-    requireState(this.writer == null, "Writer was already set to %s", this.writer);
-    requireState(keyStrength == null, "Weak keys may not be used with CacheWriter");
-
-    @SuppressWarnings("unchecked")
-    Caffeine<K1, V1> self = (Caffeine<K1, V1>) this;
-    self.writer = requireNonNull(writer);
-    return self;
-  }
-
-  <K1 extends K, V1 extends V> CacheWriter<K1, V1> getCacheWriter() {
-    @SuppressWarnings("unchecked")
-    CacheWriter<K1, V1> castedWriter = (CacheWriter<K1, V1>) writer;
-    return (writer == null) ? CacheWriter.disabledWriter() : castedWriter;
+  @SuppressWarnings({"JavaAnnotator", "unchecked"})
+  <K1 extends K, V1 extends V> @Nullable RemovalListener<K1, V1> getRemovalListener(boolean async) {
+    var castedListener = (RemovalListener<K1, V1>) removalListener;
+    return async && (castedListener != null)
+        ? (RemovalListener<K1, V1>) new AsyncRemovalListener<>(castedListener, getExecutor())
+        : castedListener;
   }
 
   /**
    * Enables the accumulation of {@link CacheStats} during the operation of the cache. Without this
    * {@link Cache#stats} will return zero for all statistics. Note that recording statistics
    * requires bookkeeping to be performed with each operation, and thus imposes a performance
-   * penalty on cache operation.
+   * penalty on cache operations.
    *
-   * @return this builder instance
+   * @return this {@code Caffeine} instance (for chaining)
    */
-  @Nonnull
+  @CanIgnoreReturnValue
   public Caffeine<K, V> recordStats() {
     requireState(this.statsCounterSupplier == null, "Statistics recording was already set");
     statsCounterSupplier = ENABLED_STATS_COUNTER_SUPPLIER;
@@ -711,15 +1007,14 @@ public final class Caffeine<K, V> {
    * Enables the accumulation of {@link CacheStats} during the operation of the cache. Without this
    * {@link Cache#stats} will return zero for all statistics. Note that recording statistics
    * requires bookkeeping to be performed with each operation, and thus imposes a performance
-   * penalty on cache operation. Any exception thrown by the supplied {@link StatsCounter} will be
+   * penalty on cache operations. Any exception thrown by the supplied {@link StatsCounter} will be
    * suppressed and logged.
    *
    * @param statsCounterSupplier a supplier instance that returns a new {@link StatsCounter}
-   * @return this builder instance
+   * @return this {@code Caffeine} instance (for chaining)
    */
-  @Nonnull
-  public Caffeine<K, V> recordStats(
-      @Nonnull Supplier<? extends StatsCounter> statsCounterSupplier) {
+  @CanIgnoreReturnValue
+  public Caffeine<K, V> recordStats(Supplier<? extends StatsCounter> statsCounterSupplier) {
     requireState(this.statsCounterSupplier == null, "Statistics recording was already set");
     requireNonNull(statsCounterSupplier);
     this.statsCounterSupplier = () -> StatsCounter.guardedStatsCounter(statsCounterSupplier.get());
@@ -730,8 +1025,7 @@ public final class Caffeine<K, V> {
     return (statsCounterSupplier != null);
   }
 
-  @Nonnull
-  Supplier<? extends StatsCounter> getStatsCounterSupplier() {
+  Supplier<StatsCounter> getStatsCounterSupplier() {
     return (statsCounterSupplier == null)
         ? StatsCounter::disabledStatsCounter
         : statsCounterSupplier;
@@ -742,12 +1036,15 @@ public final class Caffeine<K, V> {
         || (maximumWeight != UNSET_INT)
         || (expireAfterAccessNanos != UNSET_INT)
         || (expireAfterWriteNanos != UNSET_INT)
+        || (expiry != null)
         || (keyStrength != null)
         || (valueStrength != null);
   }
 
   /**
-   * Builds a cache which does not automatically load values when keys are requested.
+   * Builds a cache which does not automatically load values when keys are requested unless a
+   * mapping function is provided. Note that multiple threads can concurrently load values for
+   * distinct keys.
    * <p>
    * Consider {@link #build(CacheLoader)} instead, if it is feasible to implement a
    * {@code CacheLoader}.
@@ -759,16 +1056,15 @@ public final class Caffeine<K, V> {
    * @param <V1> the value type of the cache
    * @return a cache having the requested features
    */
-  @Nonnull
-  public <K1 extends K, V1 extends V> Cache<K1, V1> build() {
+  public <K1 extends K, V1 extends @Nullable V> Cache<K1, V1> build() {
     requireWeightWithWeigher();
     requireNonLoadingCache();
 
     @SuppressWarnings("unchecked")
-    Caffeine<K1, V1> self = (Caffeine<K1, V1>) this;
-    return isBounded() || refreshes()
-        ? new BoundedLocalCache.BoundedLocalManualCache<K1, V1>(self)
-        : new UnboundedLocalCache.UnboundedLocalManualCache<K1, V1>(self);
+    var self = (Caffeine<K1, V1>) this;
+    return isBounded()
+        ? new BoundedLocalCache.BoundedLocalManualCache<>(self)
+        : new UnboundedLocalCache.UnboundedLocalManualCache<>(self);
   }
 
   /**
@@ -784,61 +1080,120 @@ public final class Caffeine<K, V> {
    * @param <K1> the key type of the loader
    * @param <V1> the value type of the loader
    * @return a cache having the requested features
-   * @throws NullPointerException if the specified cache loader is null
    */
-  @Nonnull
-  public <K1 extends K, V1 extends V> LoadingCache<K1, V1> build(
-      @Nonnull CacheLoader<? super K1, V1> loader) {
+  public <K1 extends K, V1 extends @Nullable V> LoadingCache<K1, V1> build(
+      CacheLoader<? super K1, V1> loader) {
     requireWeightWithWeigher();
 
     @SuppressWarnings("unchecked")
-    Caffeine<K1, V1> self = (Caffeine<K1, V1>) this;
-    return isBounded() || refreshes()
-        ? new BoundedLocalCache.BoundedLocalLoadingCache<K1, V1>(self, loader)
-        : new UnboundedLocalCache.UnboundedLocalLoadingCache<K1, V1>(self, loader);
+    var self = (Caffeine<K1, V1>) this;
+    return isBounded() || refreshAfterWrite()
+        ? new BoundedLocalCache.BoundedLocalLoadingCache<>(self, loader)
+        : new UnboundedLocalCache.UnboundedLocalLoadingCache<>(self, loader);
+  }
+
+  /**
+   * Builds a cache which does not automatically load values when keys are requested unless a
+   * mapping function is provided. The returned {@link CompletableFuture} may be already loaded or
+   * currently computing the value for a given key. If the asynchronous computation fails or
+   * computes a {@code null} value then the entry will be automatically removed. Note that multiple
+   * threads can concurrently load values for distinct keys.
+   * <p>
+   * Consider {@link #buildAsync(CacheLoader)} or {@link #buildAsync(AsyncCacheLoader)} instead, if
+   * it is feasible to implement an {@code CacheLoader} or {@code AsyncCacheLoader}.
+   * <p>
+   * This method does not alter the state of this {@code Caffeine} instance, so it can be invoked
+   * again to create multiple independent caches.
+   * <p>
+   * This construction cannot be used with {@link #weakValues()}, {@link #softValues()}, or when
+   * {@link #weakKeys()} are combined with {@link #evictionListener(RemovalListener)}.
+   *
+   * @param <K1> the key type of the cache
+   * @param <V1> the value type of the cache
+   * @return a cache having the requested features
+   */
+  public <K1 extends K, V1 extends @Nullable V> AsyncCache<K1, V1> buildAsync() {
+    requireState(valueStrength == null, "Weak or soft values can not be combined with AsyncCache");
+    requireState(isStrongKeys() || (evictionListener == null),
+        "Weak keys cannot be combined with eviction listener and AsyncLoadingCache");
+    requireWeightWithWeigher();
+    requireNonLoadingCache();
+
+    @SuppressWarnings("unchecked")
+    var self = (Caffeine<K1, V1>) this;
+    return isBounded()
+        ? new BoundedLocalCache.BoundedLocalAsyncCache<>(self)
+        : new UnboundedLocalCache.UnboundedLocalAsyncCache<>(self);
   }
 
   /**
    * Builds a cache, which either returns a {@link CompletableFuture} already loaded or currently
-   * computing the value for a given key or atomically computes the value asynchronously through a
-   * supplied mapping function or the supplied {@code CacheLoader}. If the asynchronous
-   * computation fails then the entry will be automatically removed. Note that multiple threads can
-   * concurrently load values for distinct keys.
+   * computing the value for a given key, or atomically computes the value asynchronously through a
+   * supplied mapping function or the supplied {@code CacheLoader}. If the asynchronous computation
+   * fails or computes a {@code null} value then the entry will be automatically removed. Note that
+   * multiple threads can concurrently load values for distinct keys.
    * <p>
    * This method does not alter the state of this {@code Caffeine} instance, so it can be invoked
    * again to create multiple independent caches.
+   * <p>
+   * This construction cannot be used with {@link #weakValues()}, {@link #softValues()}, or when
+   * {@link #weakKeys()} are combined with {@link #evictionListener(RemovalListener)}.
    *
    * @param loader the cache loader used to obtain new values
    * @param <K1> the key type of the loader
    * @param <V1> the value type of the loader
    * @return a cache having the requested features
-   * @throws IllegalStateException if the value strength is weak or soft
-   * @throws NullPointerException if the specified cache loader is null
    */
-  @Nonnull
-  public <K1 extends K, V1 extends V> AsyncLoadingCache<K1, V1> buildAsync(
-      @Nonnull CacheLoader<? super K1, V1> loader) {
-    requireState(valueStrength == null);
-    requireState(writer == null);
+  public <K1 extends K, V1 extends @Nullable V> AsyncLoadingCache<K1, V1> buildAsync(
+      CacheLoader<? super K1, V1> loader) {
+    return buildAsync((AsyncCacheLoader<? super K1, V1>) loader);
+  }
+
+  /**
+   * Builds a cache, which either returns a {@link CompletableFuture} already loaded or currently
+   * computing the value for a given key, or atomically computes the value asynchronously through a
+   * supplied mapping function or the supplied {@code AsyncCacheLoader}. If the asynchronous
+   * computation fails or computes a {@code null} value then the entry will be automatically
+   * removed. Note that multiple threads can concurrently load values for distinct keys.
+   * <p>
+   * This method does not alter the state of this {@code Caffeine} instance, so it can be invoked
+   * again to create multiple independent caches.
+   * <p>
+   * This construction cannot be used with {@link #weakValues()}, {@link #softValues()}, or when
+   * {@link #weakKeys()} are combined with {@link #evictionListener(RemovalListener)}.
+   *
+   * @param loader the cache loader used to obtain new values
+   * @param <K1> the key type of the loader
+   * @param <V1> the value type of the loader
+   * @return a cache having the requested features
+   */
+  public <K1 extends K, V1 extends @Nullable V> AsyncLoadingCache<K1, V1> buildAsync(
+      AsyncCacheLoader<? super K1, V1> loader) {
+    requireState(valueStrength == null,
+        "Weak or soft values can not be combined with AsyncLoadingCache");
+    requireState(isStrongKeys() || (evictionListener == null),
+        "Weak keys cannot be combined with eviction listener and AsyncLoadingCache");
     requireWeightWithWeigher();
     requireNonNull(loader);
 
     @SuppressWarnings("unchecked")
-    Caffeine<K1, V1> self = (Caffeine<K1, V1>) this;
-    return isBounded() || refreshes()
-        ? new BoundedLocalCache.BoundedLocalAsyncLoadingCache<K1, V1>(self, loader)
-        : new UnboundedLocalCache.UnboundedLocalAsyncLoadingCache<K1, V1>(self, loader);
+    var self = (Caffeine<K1, V1>) this;
+    return isBounded() || refreshAfterWrite()
+        ? new BoundedLocalCache.BoundedLocalAsyncLoadingCache<>(self, loader)
+        : new UnboundedLocalCache.UnboundedLocalAsyncLoadingCache<>(self, loader);
   }
 
-  private void requireNonLoadingCache() {
-    requireState(refreshNanos == UNSET_INT, "refreshAfterWrite requires a LoadingCache");
+  void requireNonLoadingCache() {
+    requireState(refreshAfterWriteNanos == UNSET_INT, "refreshAfterWrite requires a LoadingCache");
   }
 
-  private void requireWeightWithWeigher() {
+  void requireWeightWithWeigher() {
     if (weigher == null) {
       requireState(maximumWeight == UNSET_INT, "maximumWeight requires weigher");
-    } else {
+    } else if (strictParsing) {
       requireState(maximumWeight != UNSET_INT, "weigher requires maximumWeight");
+    } else if (maximumWeight == UNSET_INT) {
+      logger.log(Level.WARNING, "ignoring weigher specified without maximumWeight");
     }
   }
 
@@ -848,41 +1203,44 @@ public final class Caffeine<K, V> {
    */
   @Override
   public String toString() {
-    StringBuilder s = new StringBuilder(64);
-    s.append(getClass().getSimpleName()).append('{');
+    var s = new StringBuilder(200)
+        .append(getClass().getSimpleName()).append('{');
     int baseLength = s.length();
     if (initialCapacity != UNSET_INT) {
-      s.append("initialCapacity=").append(initialCapacity).append(',');
+      s.append("initialCapacity=").append(initialCapacity).append(", ");
     }
     if (maximumSize != UNSET_INT) {
-      s.append("maximumSize=").append(maximumSize).append(',');
+      s.append("maximumSize=").append(maximumSize).append(", ");
     }
     if (maximumWeight != UNSET_INT) {
-      s.append("maximumWeight=").append(maximumWeight).append(',');
+      s.append("maximumWeight=").append(maximumWeight).append(", ");
     }
     if (expireAfterWriteNanos != UNSET_INT) {
-      s.append("expireAfterWrite=").append(expireAfterWriteNanos).append("ns,");
+      s.append("expireAfterWrite=").append(expireAfterWriteNanos).append("ns, ");
     }
     if (expireAfterAccessNanos != UNSET_INT) {
-      s.append("expireAfterAccess=").append(expireAfterAccessNanos).append("ns,");
+      s.append("expireAfterAccess=").append(expireAfterAccessNanos).append("ns, ");
     }
-    if (refreshNanos != UNSET_INT) {
-      s.append("refreshNanos=").append(refreshNanos).append("ns,");
+    if (expiry != null) {
+      s.append("expiry, ");
+    }
+    if (refreshAfterWriteNanos != UNSET_INT) {
+      s.append("refreshAfterWrite=").append(refreshAfterWriteNanos).append("ns, ");
     }
     if (keyStrength != null) {
-      s.append("keyStrength=").append(keyStrength.toString().toLowerCase()).append(',');
+      s.append("keyStrength=").append(keyStrength.toString().toLowerCase(US)).append(", ");
     }
     if (valueStrength != null) {
-      s.append("valueStrength=").append(valueStrength.toString().toLowerCase()).append(',');
+      s.append("valueStrength=").append(valueStrength.toString().toLowerCase(US)).append(", ");
+    }
+    if (evictionListener != null) {
+      s.append("evictionListener, ");
     }
     if (removalListener != null) {
-      s.append("removalListener,");
-    }
-    if (writer != null) {
-      s.append("writer,");
+      s.append("removalListener, ");
     }
     if (s.length() > baseLength) {
-      s.deleteCharAt(s.length() - 1);
+      s.delete(s.length() - 2, s.length());
     }
     return s.append('}').toString();
   }

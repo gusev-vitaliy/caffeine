@@ -17,13 +17,13 @@ package com.github.benmanes.caffeine.cache.simulator.policy.adaptive;
 
 import static com.google.common.base.Preconditions.checkState;
 
-import java.util.Set;
+import org.jspecify.annotations.Nullable;
 
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
-import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
 import com.google.common.base.MoreObjects;
-import com.google.common.collect.ImmutableSet;
 import com.typesafe.config.Config;
 
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
@@ -35,7 +35,7 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  * being monitored (B1, B2). The maximum size of the T1 and T2 queues is adjusted dynamically based
  * on the workload patterns and effectiveness of the cache.
  * <p>
- * This implementation is based on the pseudo code provided by the authors in their paper
+ * This implementation is based on the pseudocode provided by the authors in their paper
  * <a href="http://www.cs.cmu.edu/~15-440/READINGS/megiddo-computer2004.pdf">Outperforming LRU with
  * an Adaptive Replacement Cache Algorithm</a> and is further described in their paper,
  * <a href="https://www.usenix.org/event/fast03/tech/full_papers/megiddo/megiddo.pdf">ARC: A
@@ -46,7 +46,8 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class ArcPolicy implements Policy {
+@PolicySpec(name = "adaptive.Arc")
+public final class ArcPolicy implements KeyOnlyPolicy {
   // In Cache:
   // - T1: Pages that have been accessed at least once
   // - T2: Pages that have been accessed at least twice
@@ -73,19 +74,14 @@ public final class ArcPolicy implements Policy {
   private int p;
 
   public ArcPolicy(Config config) {
-    BasicSettings settings = new BasicSettings(config);
-    this.policyStats = new PolicyStats("adaptive.Arc");
-    this.maximumSize = settings.maximumSize();
+    var settings = new BasicSettings(config);
+    this.maximumSize = Math.toIntExact(settings.maximumSize());
+    this.policyStats = new PolicyStats(name());
     this.data = new Long2ObjectOpenHashMap<>();
     this.headT1 = new Node();
     this.headT2 = new Node();
     this.headB1 = new Node();
     this.headB2 = new Node();
-  }
-
-  /** Returns all variations of this policy based on the configuration parameters. */
-  public static Set<Policy> policies(Config config) {
-    return ImmutableSet.of(new ArcPolicy(config));
   }
 
   @Override
@@ -158,7 +154,7 @@ public final class ArcPolicy implements Policy {
     //   REPLACE(p) .
     // Put x at the top of T1 and place it in the cache.
 
-    Node node = new Node(key);
+    var node = new Node(key);
     node.type = QueueType.T1;
 
     int sizeL1 = (sizeT1 + sizeB1);
@@ -225,6 +221,8 @@ public final class ArcPolicy implements Policy {
 
   @Override
   public void finished() {
+    policyStats.setPercentAdaption((sizeT1 / (double) maximumSize) - 0.5);
+
     checkState(sizeT1 == data.values().stream().filter(node -> node.type == QueueType.T1).count());
     checkState(sizeT2 == data.values().stream().filter(node -> node.type == QueueType.T2).count());
     checkState(sizeB1 == data.values().stream().filter(node -> node.type == QueueType.B1).count());
@@ -235,15 +233,15 @@ public final class ArcPolicy implements Policy {
 
   private enum QueueType {
     T1, B1,
-    T2, B2;
+    T2, B2,
   }
 
   static final class Node {
     final long key;
 
-    Node prev;
-    Node next;
-    QueueType type;
+    @Nullable Node prev;
+    @Nullable Node next;
+    @Nullable QueueType type;
 
     Node() {
       this.key = Long.MIN_VALUE;
@@ -266,7 +264,6 @@ public final class ArcPolicy implements Policy {
 
     /** Removes the node from the list. */
     public void remove() {
-      checkState(key != Long.MIN_VALUE);
       prev.next = next;
       next.prev = prev;
       prev = next = null;

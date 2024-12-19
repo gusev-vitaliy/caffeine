@@ -15,59 +15,69 @@
  */
 package com.github.benmanes.caffeine.cache;
 
-import static com.github.benmanes.caffeine.cache.testing.CacheWriterVerifier.verifyWriter;
-import static com.github.benmanes.caffeine.cache.testing.HasRemovalNotifications.hasRemovalNotifications;
-import static com.github.benmanes.caffeine.cache.testing.HasStats.hasHitCount;
-import static com.github.benmanes.caffeine.cache.testing.HasStats.hasLoadFailureCount;
-import static com.github.benmanes.caffeine.cache.testing.HasStats.hasLoadSuccessCount;
-import static com.github.benmanes.caffeine.cache.testing.HasStats.hasMissCount;
-import static com.github.benmanes.caffeine.testing.IsEmptyIterable.deeplyEmpty;
-import static com.github.benmanes.caffeine.testing.IsEmptyMap.emptyMap;
-import static com.google.common.collect.Maps.immutableEntry;
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.both;
-import static org.hamcrest.Matchers.containsString;
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.hasEntry;
-import static org.hamcrest.Matchers.hasSize;
-import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.not;
-import static org.hamcrest.Matchers.nullValue;
+import static com.github.benmanes.caffeine.cache.RemovalCause.EXPLICIT;
+import static com.github.benmanes.caffeine.cache.RemovalCause.REPLACED;
+import static com.github.benmanes.caffeine.cache.testing.AsyncCacheSubject.assertThat;
+import static com.github.benmanes.caffeine.cache.testing.CacheContext.intern;
+import static com.github.benmanes.caffeine.cache.testing.CacheContextSubject.assertThat;
+import static com.github.benmanes.caffeine.cache.testing.CacheSubject.assertThat;
+import static com.github.benmanes.caffeine.testing.Awaits.await;
+import static com.github.benmanes.caffeine.testing.CollectionSubject.assertThat;
+import static com.github.benmanes.caffeine.testing.IntSubject.assertThat;
+import static com.github.benmanes.caffeine.testing.MapSubject.assertThat;
+import static com.google.common.base.MoreObjects.firstNonNull;
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static com.google.common.truth.Truth.assertThat;
+import static java.util.Objects.requireNonNull;
+import static java.util.function.Function.identity;
+import static org.junit.Assert.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
+import static org.slf4j.event.Level.ERROR;
+import static org.slf4j.event.Level.WARN;
 
-import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.AbstractMap;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.Spliterators;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
 import java.util.function.Function;
-import java.util.stream.Collectors;
+import java.util.function.Predicate;
 import java.util.stream.IntStream;
 
+import org.eclipse.collections.impl.factory.Sets;
+import org.mockito.Mockito;
 import org.testng.annotations.Listeners;
 import org.testng.annotations.Test;
 
 import com.github.benmanes.caffeine.cache.testing.CacheContext;
 import com.github.benmanes.caffeine.cache.testing.CacheProvider;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec;
-import com.github.benmanes.caffeine.cache.testing.CacheSpec.Compute;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec.Implementation;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec.Listener;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec.Population;
-import com.github.benmanes.caffeine.cache.testing.CacheSpec.ReferenceType;
-import com.github.benmanes.caffeine.cache.testing.CacheSpec.Writer;
 import com.github.benmanes.caffeine.cache.testing.CacheValidationListener;
+import com.github.benmanes.caffeine.cache.testing.CheckMaxLogLevel;
+import com.github.benmanes.caffeine.cache.testing.CheckNoEvictions;
 import com.github.benmanes.caffeine.cache.testing.CheckNoStats;
-import com.github.benmanes.caffeine.cache.testing.CheckNoWriter;
-import com.github.benmanes.caffeine.cache.testing.RejectingCacheWriter.DeleteException;
-import com.github.benmanes.caffeine.cache.testing.RejectingCacheWriter.WriteException;
+import com.github.benmanes.caffeine.testing.ConcurrentTestHarness;
+import com.github.benmanes.caffeine.testing.Int;
+import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Maps;
 import com.google.common.testing.SerializableTester;
 
 /**
@@ -76,1813 +86,3018 @@ import com.google.common.testing.SerializableTester;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@CheckNoEvictions @CheckMaxLogLevel(WARN)
 @Listeners(CacheValidationListener.class)
 @Test(dataProviderClass = CacheProvider.class)
 public final class AsMapTest {
   // Statistics are recorded only for computing methods for loadSuccess and loadFailure
 
-  /* ---------------- is empty / size / clear -------------- */
+  /* --------------- is empty / size / clear --------------- */
 
-  @CheckNoWriter @CheckNoStats
+  @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void isEmpty(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.isEmpty(), is(context.original().isEmpty()));
-    if (map.isEmpty()) {
-      assertThat(map, is(emptyMap()));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void isEmpty(Map<Int, Int> map, CacheContext context) {
+    if (context.original().isEmpty()) {
+      assertThat(map).isExhaustivelyEmpty();
+    } else {
+      assertThat(map.isEmpty()).isFalse();
     }
   }
 
-  @CheckNoWriter @CheckNoStats
+  @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void size(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.size(), is(context.original().size()));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void size(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.size()).isEqualTo(context.initialSize());
   }
 
   @CacheSpec
   @CheckNoStats
   @Test(dataProvider = "caches")
-  public void clear(Map<Integer, Integer> map, CacheContext context) {
+  public void clear(Map<Int, Int> map, CacheContext context) {
     map.clear();
-    assertThat(map, is(emptyMap()));
-    assertThat(map, hasRemovalNotifications(context,
-        context.original().size(), RemovalCause.EXPLICIT));
-
-    verifyWriter(context, (verifier, writer) -> {
-      verifier.deletedAll(context.original(), RemovalCause.EXPLICIT);
-    });
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
   }
+
+  /* --------------- contains --------------- */
 
   @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = DeleteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void clear_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.clear();
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
-  }
-
-  /* ---------------- contains -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void containsKey_null(Map<Integer, Integer> map, CacheContext context) {
-    map.containsKey(null);
-  }
-
-  @CheckNoWriter @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void containsKey_present(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.containsKey(key), is(true));
-    }
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void containsKey_absent(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.containsKey(context.absentKey()), is(false));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void containsValue_null(Map<Integer, Integer> map, CacheContext context) {
-    map.containsValue(null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void containsValue_present(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.containsValue(context.original().get(key)), is(true));
-    }
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void containsValue_absent(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.containsValue(context.absentValue()), is(false));
-  }
-
-  /* ---------------- get -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void get_null(Map<Integer, Integer> map, CacheContext context) {
-    map.get(null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void get_absent(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.get(context.absentKey()), is(nullValue()));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void get_present(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.get(key), is(context.original().get(key)));
-    }
-  }
-
-  /* ---------------- getOrDefault -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void getOrDefault_nullKey(Map<Integer, Integer> map, CacheContext context) {
-    map.getOrDefault(null, 1);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void getOrDefault_absent(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.getOrDefault(context.absentKey(), null), is(nullValue()));
-    assertThat(map.getOrDefault(context.absentKey(), context.absentKey()), is(context.absentKey()));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void getOrDefault_present(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.getOrDefault(key, context.absentKey()), is(context.original().get(key)));
-    }
-  }
-
-  /* ---------------- forEach -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void forEach_null(Map<Integer, Integer> map, CacheContext context) {
-    map.forEach(null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void forEach_scan(Map<Integer, Integer> map, CacheContext context) {
-    Map<Integer, Integer> remaining = new HashMap<>(context.original());
-    map.forEach(remaining::remove);
-    assertThat(remaining, is(emptyMap()));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void containsKey_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.containsKey(null));
   }
 
   @CheckNoStats
   @Test(dataProvider = "caches")
   @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void forEach_modify(Map<Integer, Integer> map, CacheContext context) {
-    // non-deterministic traversal behavior with modifications, but shouldn't become corrupted
-    List<Integer> modified = new ArrayList<>();
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void containsKey_present(Map<Int, Int> map, CacheContext context) {
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map.containsKey(key)).isTrue();
+    }
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void containsKey_absent(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.containsKey(context.absentKey())).isFalse();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void containsKey_inFlight(AsyncCache<Int, Int> cache, CacheContext context) {
+    var future = new CompletableFuture<Int>();
+    cache.put(context.absentKey(), future);
+    assertThat(cache.synchronous().asMap().containsKey(context.absentKey())).isFalse();
+    cache.synchronous().invalidate(context.absentKey());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void containsValue_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.containsValue(null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void containsValue_present(Map<Int, Int> map, CacheContext context) {
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map.containsValue(context.original().get(key))).isTrue();
+    }
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void containsValue_absent(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.containsValue(context.absentValue())).isFalse();
+  }
+
+  /* --------------- get --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void get_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.get(null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void get_absent(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.get(context.absentKey())).isNull();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void get_present(Map<Int, Int> map, CacheContext context) {
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map.get(key)).isEqualTo(context.original().get(key));
+    }
+  }
+
+  /* --------------- getOrDefault --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void getOrDefault_nullKey(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.getOrDefault(null, Int.valueOf(1)));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void getOrDefault_absent(Map<Int, Int> map, CacheContext context) {
+    Int key = context.absentKey();
+    assertThat(map.getOrDefault(key, null)).isNull();
+    assertThat(map.getOrDefault(key, key.negate())).isEqualTo(key.negate());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void getOrDefault_present(Map<Int, Int> map, CacheContext context) {
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map.getOrDefault(key, context.absentKey())).isEqualTo(context.original().get(key));
+    }
+  }
+
+  /* --------------- forEach --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void forEach_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.forEach(null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void forEach_scan(Map<Int, Int> map, CacheContext context) {
+    var remaining = new HashMap<Int, Int>(context.original());
     map.forEach((key, value) -> {
-      Integer newKey = context.lastKey() + key;
-      modified.add(newKey); // for weak keys
+      assertThat(key).isNotNull();
+      assertThat(value).isNotNull();
+      assertThat(remaining.remove(key, value)).isTrue();
+    });
+    assertThat(remaining).isExhaustivelyEmpty();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void forEach_modify(Map<Int, Int> map, CacheContext context) {
+    // non-deterministic traversal behavior with modifications, but shouldn't become corrupted
+    map.forEach((key, value) -> {
+      Int newKey = intern(context.lastKey().add(key));
       map.put(newKey, key);
     });
   }
 
-  /* ---------------- put -------------- */
+  /* --------------- put --------------- */
 
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void put_nullKey(Map<Integer, Integer> map, CacheContext context) {
-    map.put(null, 1);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void put_nullValue(Map<Integer, Integer> map, CacheContext context) {
-    map.put(1, null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void put_nullKeyAndValue(Map<Integer, Integer> map, CacheContext context) {
-    map.put(null, null);
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void put_nullKey(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.put(null, Int.valueOf(1)));
   }
 
   @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = WriteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void put_insert_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.put(context.absentKey(), context.absentValue());
-    } finally {
-      assertThat(map, equalTo(context.original()));
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void put_nullValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.put(Int.valueOf(1), null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void put_nullKeyAndValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.put(null, null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void put_insert(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.put(context.absentKey(), context.absentValue())).isNull();
+    assertThat(map).containsEntry(context.absentKey(), context.absentValue());
+    assertThat(map).hasSize(context.initialSize() + 1);
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void put_replace_sameValue(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = intern(new Int(context.original().get(key)));
+      assertThat(map.put(key, value)).isSameInstanceAs(context.original().get(key));
+      assertThat(map).containsEntry(key, value);
+      replaced.put(key, value);
     }
+    assertThat(map).hasSize(context.initialSize());
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(replaced).exclusively();
   }
 
   @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = WriteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void put_replace_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.put(context.middleKey(), context.absentValue());
-    } finally {
-      assertThat(map, equalTo(context.original()));
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void put_replace_sameInstance(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map.put(key, value)).isSameInstanceAs(context.original().get(key));
+      assertThat(map).containsEntry(key, value);
+      replaced.put(key, value);
+    }
+    assertThat(map).hasSize(context.initialSize());
+
+    if (context.isGuava()) {
+      assertThat(context).removalNotifications().withCause(REPLACED)
+          .contains(replaced).exclusively();
+    } else {
+      assertThat(context).removalNotifications().isEmpty();
     }
   }
 
   @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void put_insert(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.put(context.absentKey(), context.absentValue()), is(nullValue()));
-    assertThat(map.get(context.absentKey()), is(context.absentValue()));
-    assertThat(map.size(), is(context.original().size() + 1));
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void put_replace_differentValue(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map.put(key, context.absentValue())).isEqualTo(value);
+      assertThat(map).containsEntry(key, context.absentValue());
+      replaced.put(key, value);
+    }
 
-    verifyWriter(context, (verifier, writer) -> {
-      verifier.wrote(context.absentKey(), context.absentValue());
+    assertThat(map).hasSize(context.initialSize());
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(replaced).exclusively();
+  }
+
+  @CheckMaxLogLevel(ERROR)
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY)
+  public void put_recursiveUpdate(Map<Int, Int> map, CacheContext context) {
+    map.put(context.absentKey(), context.absentValue());
+    var result = map.compute(context.absentKey(), (key, value) -> {
+      var oldValue = map.put(key, intern(value.add(1)));
+      assertThat(oldValue).isEqualTo(value);
+      return key;
     });
+    assertThat(result).isEqualTo(context.absentKey());
+    assertThat(map).containsExactly(context.absentKey(), context.absentKey());
   }
 
-  @CheckNoWriter @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.CONSUMING })
-  public void put_replace_sameValue(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.put(key, value), is(value));
-      assertThat(map.get(key), is(value));
-    }
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(map.size(), is(context.original().size()));
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.REPLACED));
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = {Listener.DISABLED, Listener.REJECTING})
+  public void put_async_null(AsyncCache<Int, Int> cache, CacheContext context) {
+    Int key = context.absentKey();
+    Int newValue = context.absentValue();
+    var future = new CompletableFuture<Int>();
+
+    cache.put(key, future);
+    var start = new AtomicBoolean();
+    var done = new AtomicBoolean();
+    ConcurrentTestHarness.execute(() -> {
+      start.set(true);
+      Int result = cache.synchronous().asMap().put(key, newValue);
+      assertThat(result).isNull();
+      done.set(true);
+    });
+
+    await().untilTrue(start);
+    future.complete(null);
+
+    await().untilTrue(done);
+    assertThat(cache).containsEntry(key, newValue);
+  }
+
+  /* --------------- putAll --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void putAll_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.putAll(null));
   }
 
   @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.CONSUMING })
-  public void put_replace_differentValue(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.put(key, context.absentValue()), is(value));
-      assertThat(map.get(key), is(context.absentValue()));
-
-      verifyWriter(context, (verifier, writer) -> {
-        verifier.wrote(key, context.absentValue());
-      });
-    }
-
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(map.size(), is(context.original().size()));
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.REPLACED));
-  }
-
-  /* ---------------- putAll -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void putAll_null(Map<Integer, Integer> map, CacheContext context) {
-    map.putAll(null);
-  }
-
-  @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = WriteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-  compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void putAll_insert_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.putAll(context.absent());
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
-  }
-
-  @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = WriteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void putAll_replace_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.putAll(ImmutableMap.of(context.middleKey(), context.absentValue()));
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void putAll_empty(Map<Integer, Integer> map, CacheContext context) {
-    map.putAll(new HashMap<>());
-    assertThat(map.size(), is(context.original().size()));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void putAll_empty(Map<Int, Int> map, CacheContext context) {
+    map.putAll(Map.of());
+    assertThat(map).hasSize(context.initialSize());
   }
 
   @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void putAll_insert(Map<Integer, Integer> map, CacheContext context) {
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void putAll_insert(Map<Int, Int> map, CacheContext context) {
     int startKey = context.original().size() + 1;
-    Map<Integer, Integer> entries = IntStream
-        .range(startKey, 100 + startKey).boxed()
-        .collect(Collectors.toMap(Function.identity(), key -> -key));
+    var entries = IntStream
+        .range(startKey, 100 + startKey)
+        .mapToObj(Int::valueOf)
+        .collect(toImmutableMap(identity(), Int::negate));
     map.putAll(entries);
-    assertThat(map.size(), is(100 + context.original().size()));
-
-    verifyWriter(context, (verifier, writer) -> {
-      verifier.wroteAll(entries);
-    });
+    assertThat(map).hasSize(100 + context.initialSize());
   }
 
   @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.CONSUMING })
-  public void putAll_replace(Map<Integer, Integer> map, CacheContext context) {
-    Map<Integer, Integer> entries = new LinkedHashMap<>(context.original());
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void putAll_replace(Map<Int, Int> map, CacheContext context) {
+    var entries = new LinkedHashMap<Int, Int>(context.original());
     entries.replaceAll((key, value) -> key);
     map.putAll(entries);
-    assertThat(map, is(equalTo(entries)));
-    assertThat(map, hasRemovalNotifications(context, entries.size(), RemovalCause.REPLACED));
-
-    verifyWriter(context, (verifier, writer) -> {
-      verifier.wroteAll(entries);
-    });
+    assertThat(map).isEqualTo(entries);
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(context.original()).exclusively();
   }
 
   @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.CONSUMING })
-  public void putAll_mixed(Map<Integer, Integer> map, CacheContext context) {
-    Map<Integer, Integer> expect = new HashMap<>(context.original());
-    Map<Integer, Integer> entries = new HashMap<>();
-    for (int i = 0; i < 2 * context.original().size(); i++) {
-      int value = ((i % 2) == 0) ? i : (i + 1);
-      entries.put(i, value);
-    }
-    expect.putAll(entries);
+  @CacheSpec(population = { Population.PARTIAL, Population.FULL })
+  public void putAll_mixed(Map<Int, Int> map, CacheContext context) {
+    var entries = new HashMap<Int, Int>();
+    var replaced = new HashMap<Int, Int>();
+    context.original().forEach((key, value) -> {
+      if ((key.intValue() % 2) == 0) {
+        value = intern(value.add(1));
+        replaced.put(key, value);
+      }
+      entries.put(key, value);
+    });
 
     map.putAll(entries);
-    assertThat(map, is(equalTo(expect)));
-    assertThat(map, hasRemovalNotifications(context, entries.size() / 2, RemovalCause.REPLACED));
+    assertThat(map).isEqualTo(entries);
+    var expect = context.isGuava() ? entries : replaced;
+    for (var entry : expect.entrySet()) {
+      entry.setValue(context.original().get(entry.getKey()));
+    }
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(expect).exclusively();
+  }
 
-    verifyWriter(context, (verifier, writer) -> {
-      verifier.wroteAll(entries);
+  /* --------------- putIfAbsent --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void putIfAbsent_nullKey(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.putIfAbsent(null, Int.valueOf(2)));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void putIfAbsent_nullValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.putIfAbsent(Int.valueOf(1), null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void putIfAbsent_nullKeyAndValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.putIfAbsent(null, null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void putIfAbsent_present(Map<Int, Int> map, CacheContext context) {
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map.putIfAbsent(key, key)).isEqualTo(value);
+      assertThat(map).containsEntry(key, value);
+    }
+    assertThat(map).hasSize(context.initialSize());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void putIfAbsent_insert(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.putIfAbsent(context.absentKey(), context.absentValue())).isNull();
+    assertThat(map).containsEntry(context.absentKey(), context.absentValue());
+    assertThat(map).hasSize(context.initialSize() + 1);
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = {Listener.DISABLED, Listener.REJECTING})
+  public void putIfAbsent_async_null(AsyncCache<Int, Int> cache, CacheContext context) {
+    Int key = context.absentKey();
+    Int newValue = context.absentValue();
+    var future = new CompletableFuture<Int>();
+
+    cache.put(key, future);
+    var start = new AtomicBoolean();
+    var done = new AtomicBoolean();
+    ConcurrentTestHarness.execute(() -> {
+      start.set(true);
+      Int result = cache.synchronous().asMap().putIfAbsent(key, newValue);
+      assertThat(result).isNull();
+      done.set(true);
     });
+
+    await().untilTrue(start);
+    future.complete(null);
+
+    await().untilTrue(done);
+    assertThat(cache).containsEntry(key, newValue);
   }
 
-  /* ---------------- putIfAbsent -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void putIfAbsent_nullKey(Map<Integer, Integer> map, CacheContext context) {
-    map.putIfAbsent(null, 2);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void putIfAbsent_nullValue(Map<Integer, Integer> map, CacheContext context) {
-    map.putIfAbsent(1, null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void putIfAbsent_nullKeyAndValue(Map<Integer, Integer> map, CacheContext context) {
-    map.putIfAbsent(null, null);
-  }
+  /* --------------- remove --------------- */
 
   @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = WriteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void putIfAbsent_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.putIfAbsent(context.absentKey(), context.absentValue());
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
-  }
-
-  @CheckNoWriter @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-  removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void putIfAbsent_present(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.putIfAbsent(key, key), is(value));
-      assertThat(map.get(key), is(value));
-    }
-    assertThat(map.size(), is(context.original().size()));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void remove_nullKey(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.remove(null));
   }
 
   @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void putIfAbsent_insert(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.putIfAbsent(context.absentKey(), context.absentValue()), is(nullValue()));
-    assertThat(map.get(context.absentKey()), is(context.absentValue()));
-    assertThat(map.size(), is(context.original().size() + 1));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void remove_absent(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.remove(context.absentKey())).isNull();
+    assertThat(map).hasSize(context.initialSize());
+  }
 
-    verifyWriter(context, (verifier, writer) -> {
-      verifier.wrote(context.absentKey(), context.absentValue());
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void remove_present(Map<Int, Int> map, CacheContext context) {
+    var removed = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = map.remove(key);
+      removed.put(key, value);
+    }
+    int expectedSize = context.original().size() - context.firstMiddleLastKeys().size();
+    assertThat(map).hasSize(expectedSize);
+
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(removed).exclusively();
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = {Listener.DISABLED, Listener.REJECTING})
+  public void remove_async_null(AsyncCache<Int, Int> cache, CacheContext context) {
+    var future = new CompletableFuture<Int>();
+    Int key = context.absentKey();
+
+    cache.put(key, future);
+    var start = new AtomicBoolean();
+    var done = new AtomicBoolean();
+    ConcurrentTestHarness.execute(() -> {
+      start.set(true);
+      Int result = cache.synchronous().asMap().remove(key);
+      assertThat(result).isNull();
+      done.set(true);
     });
+
+    await().untilTrue(start);
+    future.complete(null);
+
+    await().untilTrue(done);
+    assertThat(cache).doesNotContainKey(key);
   }
 
-  /* ---------------- remove -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void remove_nullKey(Map<Integer, Integer> map, CacheContext context) {
-    map.remove(null);
-  }
+  /* --------------- remove conditionally --------------- */
 
   @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = DeleteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void remove_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.remove(context.middleKey());
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
-  }
-
-  @CheckNoWriter @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void remove_absent(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.remove(context.absentKey()), is(nullValue()));
-    assertThat(map.size(), is(context.original().size()));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void removeConditionally_nullKey(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.remove(null, context.absentValue()));
   }
 
   @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void remove_present(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      map.remove(key);
-      verifyWriter(context, (verifier, writer) -> {
-        verifier.deleted(key, context.original().get(key), RemovalCause.EXPLICIT);
-      });
-    }
-    assertThat(map.size(), is(context.original().size() - context.firstMiddleLastKeys().size()));
-
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.EXPLICIT));
-    verifyWriter(context, (verifier, writer) -> verifier.deletions(count, RemovalCause.EXPLICIT));
-  }
-
-  /* ---------------- remove conditionally -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void removeConditionally_nullKey(Map<Integer, Integer> map, CacheContext context) {
-    map.remove(null, 1);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void removeConditionally_nullValue(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.remove(1, null), is(false)); // see ConcurrentHashMap
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void removeConditionally_nullKeyAndValue(Map<Integer, Integer> map, CacheContext context) {
-    map.remove(null, null);
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void removeConditionally_nullValue(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.remove(context.absentKey(), null)).isFalse(); // see ConcurrentHashMap
   }
 
   @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = DeleteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void removeConditionally_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.remove(context.middleKey(), context.original().get(context.middleKey()));
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
-  }
-
-  @CheckNoWriter @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void removeConditionally_absent(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.remove(context.absentKey(), context.absentValue()), is(false));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void removeConditionally_nullKeyAndValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.remove(null, null));
   }
 
-  @CheckNoWriter @CheckNoStats
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void removeConditionally_absent(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.remove(context.absentKey(), context.absentValue())).isFalse();
+  }
+
+  @CheckNoStats
   @Test(dataProvider = "caches")
   @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void removeConditionally_presentKey(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.remove(key, key), is(false));
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void removeConditionally_presentKey(Map<Int, Int> map, CacheContext context) {
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map.remove(key, key)).isFalse();
     }
-    assertThat(map.size(), is(context.original().size()));
+    assertThat(map).hasSize(context.initialSize());
   }
 
   @CheckNoStats
   @Test(dataProvider = "caches")
   @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void removeConditionally_presentKeyAndValue(Map<Integer, Integer> map,
-      CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.remove(key, value), is(true));
-      verifyWriter(context, (verifier, writer) -> {
-        verifier.deleted(key, value, RemovalCause.EXPLICIT);
-      });
+  public void removeConditionally_presentKeyAndValue(Map<Int, Int> map, CacheContext context) {
+    var removed = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map.remove(key, value)).isTrue();
+      removed.put(key, value);
     }
     int count = context.firstMiddleLastKeys().size();
-    assertThat(map.size(), is(context.original().size() - count));
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.EXPLICIT));
-    verifyWriter(context, (verifier, writer) -> verifier.deletions(count, RemovalCause.EXPLICIT));
+    assertThat(map).hasSize(context.initialSize() - count);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(removed).exclusively();
   }
 
-  /* ---------------- replace -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replace_null(Map<Integer, Integer> map, CacheContext context) {
-    map.replace(null, 1);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replace_nullValue(Map<Integer, Integer> map, CacheContext context) {
-    map.replace(1, null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replace_nullKeyAndValue(Map<Integer, Integer> map, CacheContext context) {
-    map.replace(null, null);
-  }
-
-  @CheckNoWriter @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replace_absent(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.replace(context.absentKey(), context.absentValue()), is(nullValue()));
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = {Listener.DISABLED, Listener.REJECTING})
+  public void removeConditionally_async_null(
+      AsyncCache<Int, Int> cache, CacheContext context) {
+    Int key = context.absentKey();
+    Int newValue = context.absentValue();
+    var future = new CompletableFuture<Int>();
+
+    cache.put(key, future);
+    var start = new AtomicBoolean();
+    var done = new AtomicBoolean();
+    ConcurrentTestHarness.execute(() -> {
+      start.set(true);
+      boolean result = cache.synchronous().asMap().remove(key, newValue);
+      assertThat(result).isFalse();
+      done.set(true);
+    });
+
+    await().untilTrue(start);
+    future.complete(null);
+
+    await().untilTrue(done);
+    assertThat(cache).doesNotContainKey(key);
+  }
+
+  /* --------------- replace --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replace_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.replace(null, Int.valueOf(1)));
   }
 
   @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = WriteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void replace_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.replace(context.middleKey(), context.absentValue());
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replace_nullValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.replace(Int.valueOf(1), null));
   }
 
-  @CheckNoWriter @CheckNoStats
+  @CheckNoStats
   @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void replace_sameValue(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.replace(key, value), is(value));
-      assertThat(map.get(key), is(value));
-    }
-    assertThat(map.size(), is(context.original().size()));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replace_nullKeyAndValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.replace(null, null));
+  }
 
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.REPLACED));
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replace_absent(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.replace(context.absentKey(), context.absentValue())).isNull();
   }
 
   @CheckNoStats
   @Test(dataProvider = "caches")
   @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void replace_differentValue(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer oldValue = context.original().get(key);
-      assertThat(map.replace(key, context.absentValue()), is(oldValue));
-      assertThat(map.get(key), is(context.absentValue()));
-      verifyWriter(context, (verifier, writer) -> verifier.wrote(key, context.absentValue()));
+  public void replace_sameValue(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = intern(new Int(context.original().get(key)));
+      assertThat(map.replace(key, value)).isSameInstanceAs(context.original().get(key));
+      assertThat(map).containsEntry(key, value);
+      replaced.put(key, value);
     }
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(map.size(), is(context.original().size()));
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.REPLACED));
-    verifyWriter(context, (verifier, writer) -> verifier.writes(count));
-  }
-
-  /* ---------------- replace conditionally -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replaceConditionally_nullKey(Map<Integer, Integer> map, CacheContext context) {
-    map.replace(null, 1, 1);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replaceConditionally_nullOldValue(Map<Integer, Integer> map, CacheContext context) {
-    map.replace(1, null, 1);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replaceConditionally_nullNewValue(Map<Integer, Integer> map, CacheContext context) {
-    map.replace(1, 1, null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replaceConditionally_nullKeyAndOldValue(Map<Integer, Integer> map, CacheContext context) {
-    map.replace(null, null, 1);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replaceConditionally_nullKeyAndNewValue(Map<Integer, Integer> map, CacheContext context) {
-    map.replace(null, 1, null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replaceConditionally_nullOldAndNewValue(Map<Integer, Integer> map, CacheContext context) {
-    map.replace(1, null, null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replaceConditionally_nullKeyAndValues(Map<Integer, Integer> map, CacheContext context) {
-    map.replace(null, null, null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replaceConditionally_absent(Map<Integer, Integer> map, CacheContext context) {
-    Integer key = context.absentKey();
-    assertThat(map.replace(key, key, key), is(false));
+    assertThat(map).hasSize(context.initialSize());
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(replaced).exclusively();
   }
 
   @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = WriteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void replaceConditionally_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      Integer key = context.middleKey();
-      map.replace(key, context.original().get(key), context.absentValue());
-    } finally {
-      assertThat(map, equalTo(context.original()));
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void replace_sameInstance(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map.replace(key, value)).isSameInstanceAs(value);
+      assertThat(map).containsEntry(key, value);
+      replaced.put(key, value);
+    }
+    assertThat(map).hasSize(context.initialSize());
+
+    if (context.isGuava()) {
+      assertThat(context).removalNotifications().withCause(REPLACED)
+          .contains(replaced).exclusively();
+    } else {
+      assertThat(context).removalNotifications().isEmpty();
     }
   }
 
-  @CheckNoWriter @CheckNoStats
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void replace_differentValue(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int oldValue = context.original().get(key);
+      assertThat(map.replace(key, context.absentValue())).isEqualTo(oldValue);
+      assertThat(map).containsEntry(key, context.absentValue());
+      replaced.put(key, oldValue);
+    }
+    assertThat(map).hasSize(context.initialSize());
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(replaced).exclusively();
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = {Listener.DISABLED, Listener.REJECTING})
+  public void replace_async_null(AsyncCache<Int, Int> cache, CacheContext context) {
+    Int key = context.absentKey();
+    Int newValue = context.absentValue();
+    var future = new CompletableFuture<Int>();
+
+    cache.put(key, future);
+    var start = new AtomicBoolean();
+    var done = new AtomicBoolean();
+    ConcurrentTestHarness.execute(() -> {
+      start.set(true);
+      Int result = cache.synchronous().asMap().replace(key, newValue);
+      assertThat(result).isNull();
+      done.set(true);
+    });
+
+    await().untilTrue(start);
+    future.complete(null);
+
+    await().untilTrue(done);
+    assertThat(cache).doesNotContainKey(key);
+  }
+
+  /* --------------- replace conditionally --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replaceConditionally_nullKey(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () ->
+        map.replace(null, Int.valueOf(1), Int.valueOf(1)));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replaceConditionally_nullOldValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () ->
+        map.replace(Int.valueOf(1), null, Int.valueOf(1)));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replaceConditionally_nullNewValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () ->
+        map.replace(Int.valueOf(1), Int.valueOf(1), null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replaceConditionally_nullKeyAndOldValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.replace(null, null, Int.valueOf(1)));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replaceConditionally_nullKeyAndNewValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.replace(null, Int.valueOf(1), null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replaceConditionally_nullOldAndNewValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.replace(Int.valueOf(1), null, null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replaceConditionally_nullKeyAndValues(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.replace(null, null, null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replaceConditionally_absent(Map<Int, Int> map, CacheContext context) {
+    Int key = context.absentKey();
+    assertThat(map.replace(key, key, key)).isFalse();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void replaceConditionally_wrongOldValue(Map<Int, Int> map, CacheContext context) {
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map.replace(key, key, context.absentKey())).isFalse();
+      assertThat(map).containsEntry(key, value);
+    }
+    assertThat(map).hasSize(context.initialSize());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void replaceConditionally_sameValue(Cache<Int, Int> cache, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      var oldValue = cache.asMap().get(key);
+      var newValue = intern(new Int(cache.asMap().get(key)));
+      assertThat(cache.asMap().replace(key, oldValue, newValue)).isTrue();
+      assertThat(cache).containsEntry(key, newValue);
+      replaced.put(key, oldValue);
+    }
+    assertThat(cache).hasSize(context.initialSize());
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(replaced).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void replaceConditionally_sameInstance(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map.replace(key, value, value)).isTrue();
+      assertThat(map).containsEntry(key, value);
+      replaced.put(key, value);
+    }
+    assertThat(map).hasSize(context.initialSize());
+
+    if (context.isGuava()) {
+      assertThat(context).removalNotifications().withCause(REPLACED)
+          .contains(replaced).exclusively();
+    } else {
+      assertThat(context).removalNotifications().isEmpty();
+    }
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void replaceConditionally_differentValue(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map.replace(key, value, context.absentValue())).isTrue();
+      assertThat(map).containsEntry(key, context.absentValue());
+      replaced.put(key, value);
+    }
+    assertThat(map).hasSize(context.initialSize());
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(replaced).exclusively();
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = {Listener.DISABLED, Listener.REJECTING})
+  public void replaceConditionally_async_null(
+      AsyncCache<Int, Int> cache, CacheContext context) {
+    Int key = context.absentKey();
+    Int newValue = context.absentValue();
+    var future = new CompletableFuture<Int>();
+
+    cache.put(key, future);
+    var start = new AtomicBoolean();
+    var done = new AtomicBoolean();
+    ConcurrentTestHarness.execute(() -> {
+      start.set(true);
+      boolean replaced = cache.synchronous().asMap().replace(key, key, newValue);
+      assertThat(replaced).isFalse();
+      done.set(true);
+    });
+
+    await().untilTrue(start);
+    future.complete(null);
+
+    await().untilTrue(done);
+    assertThat(cache).doesNotContainKey(key);
+  }
+
+  /* --------------- replaceAll --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replaceAll_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.replaceAll(null));
+  }
+
+  @CheckNoStats
   @Test(dataProvider = "caches")
   @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void replaceConditionally_wrongOldValue(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.replace(key, key, context.absentKey()), is(false));
-      assertThat(map.get(key), is(value));
-    }
-    assertThat(map.size(), is(context.original().size()));
-
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.REPLACED));
-  }
-
-  @CheckNoStats @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void replaceConditionally_sameValue(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.replace(key, value, value), is(true));
-      assertThat(map.get(key), is(value));
-    }
-    assertThat(map.size(), is(context.original().size()));
-
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.REPLACED));
-  }
-
-  @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void replaceConditionally_differentValue(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.replace(key, context.original().get(key), context.absentValue()), is(true));
-      assertThat(map.get(key), is(context.absentValue()));
-      verifyWriter(context, (verifier, writer) -> verifier.wrote(key, context.absentValue()));
-    }
-    assertThat(map.size(), is(context.original().size()));
-
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.REPLACED));
-    verifyWriter(context, (verifier, writer) -> verifier.writes(count));
-  }
-
-  /* ---------------- replaceAll -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void replaceAll_null(Map<Integer, Integer> map, CacheContext context) {
-    map.replaceAll(null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void replaceAll_nullValue(Map<Integer, Integer> map, CacheContext context) {
-    map.replaceAll((key, value) -> null);
-  }
-
-  @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = WriteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void replaceAll_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.replaceAll((key, value) -> context.absentValue());
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void replaceAll_nullValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.replaceAll((key, value) -> null));
   }
 
   @CacheSpec
-  @CheckNoWriter @CheckNoStats
+  @CheckNoStats
   @Test(dataProvider = "caches")
-  public void replaceAll_sameValue(Map<Integer, Integer> map, CacheContext context) {
+  public void replaceAll_sameValue(Map<Int, Int> map, CacheContext context) {
     map.replaceAll((key, value) -> value);
-    assertThat(map, is(equalTo(context.original())));
-    assertThat(map, hasRemovalNotifications(context, map.size(), RemovalCause.REPLACED));
+    assertThat(map).containsExactlyEntriesIn(context.original());
+
+    if (context.isGuava()) {
+      assertThat(context).removalNotifications().withCause(REPLACED)
+          .contains(context.original()).exclusively();
+    } else {
+      assertThat(context).removalNotifications().isEmpty();
+    }
   }
 
   @CacheSpec
   @CheckNoStats
   @Test(dataProvider = "caches")
-  public void replaceAll_differentValue(Map<Integer, Integer> map, CacheContext context) {
+  public void replaceAll_differentValue(Map<Int, Int> map, CacheContext context) {
     map.replaceAll((key, value) -> key);
     map.forEach((key, value) -> {
-      assertThat(value, is(equalTo(key)));
-      verifyWriter(context, (verifier, writer) -> verifier.wrote(key, key));
+      assertThat(value).isEqualTo(key);
     });
-    assertThat(map, hasRemovalNotifications(context, map.size(), RemovalCause.REPLACED));
-    verifyWriter(context, (verifier, writer) -> verifier.writes(context.original().size()));
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(context.original()).exclusively();
   }
 
-  /* ---------------- computeIfAbsent -------------- */
+  /* --------------- computeIfAbsent --------------- */
 
-  @CheckNoStats @CheckNoWriter
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void computeIfAbsent_nullKey(Map<Integer, Integer> map, CacheContext context) {
-    map.computeIfAbsent(null, key -> -key);
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void computeIfAbsent_nullKey(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.computeIfAbsent(null, Int::negate));
   }
 
-  @CheckNoStats @CheckNoWriter
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void computeIfAbsent_nullMappingFunction(Map<Integer, Integer> map, CacheContext context) {
-    map.computeIfAbsent(context.absentKey(), null);
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void computeIfAbsent_nullMappingFunction(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.computeIfAbsent(context.absentKey(), null));
   }
 
   @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void computeIfAbsent_nullValue(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.computeIfAbsent(context.absentKey(), key -> null), is(nullValue()));
-    assertThat(map.size(), is(context.original().size()));
-    assertThat(context, both(hasMissCount(1)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(0)).and(hasLoadFailureCount(1)));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void computeIfAbsent_nullValue(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.computeIfAbsent(context.absentKey(), key -> null)).isNull();
+    assertThat(context).stats().hits(0).misses(1).success(0).failures(1);
+    assertThat(map).hasSize(context.initialSize());
   }
 
-  // FIXME: Requires JDK8 release with JDK-8062841 fix
-  @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(enabled = false, dataProvider = "caches", expectedExceptions = IllegalStateException.class)
-  public void computeIfAbsent_recursive(Map<Integer, Integer> map, CacheContext context) {
-    Function<Integer, Integer> mappingFunction = new Function<Integer, Integer>() {
-      @Override public Integer apply(Integer key) {
+  @CacheSpec
+  @Test(dataProvider = "caches")
+  public void computeIfAbsent_recursive(Map<Int, Int> map, CacheContext context) {
+    var mappingFunction = new Function<Int, Int>() {
+      @Override public Int apply(Int key) {
         return map.computeIfAbsent(key, this);
       }
     };
-    map.computeIfAbsent(context.absentKey(), mappingFunction);
+    var error = assertThrows(Throwable.class,
+        () -> map.computeIfAbsent(context.absentKey(), mappingFunction));
+    assertThat(error.getClass()).isAnyOf(StackOverflowError.class, IllegalStateException.class);
   }
 
-  // FIXME: Requires JDK8 release with JDK-8062841 fix
-  @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(enabled = false, dataProvider = "caches", expectedExceptions = IllegalStateException.class)
-  public void computeIfAbsent_pingpong(Map<Integer, Integer> map, CacheContext context) {
-    Function<Integer, Integer> mappingFunction = new Function<Integer, Integer>() {
-      @Override public Integer apply(Integer key) {
-        Integer value = context.original().get(key);
-        return map.computeIfAbsent(value, this);
+  @CacheSpec
+  @Test(dataProvider = "caches")
+  public void computeIfAbsent_pingpong(Map<Int, Int> map, CacheContext context) {
+    var mappingFunction = new Function<Int, Int>() {
+      @Override public Int apply(Int key) {
+        return map.computeIfAbsent(key.negate(), this);
       }
     };
-    map.computeIfAbsent(context.absentKey(), mappingFunction);
+    var error = assertThrows(Throwable.class,
+        () -> map.computeIfAbsent(context.absentKey(), mappingFunction));
+    assertThat(error.getClass()).isAnyOf(StackOverflowError.class, IllegalStateException.class);
   }
 
-  @CheckNoWriter
   @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void computeIfAbsent_error(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.computeIfAbsent(context.absentKey(), key -> { throw new Error(); });
-    } catch (Error e) {}
-    assertThat(map, is(equalTo(context.original())));
-    assertThat(context, both(hasMissCount(1)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(0)).and(hasLoadFailureCount(1)));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void computeIfAbsent_error(Map<Int, Int> map, CacheContext context) {
+    assertThrows(ExpectedError.class, () ->
+        map.computeIfAbsent(context.absentKey(), key -> { throw new ExpectedError(); }));
+    assertThat(map).containsExactlyEntriesIn(context.original());
+    assertThat(context).stats().hits(0).misses(1).success(0).failures(1);
+    assertThat(map.computeIfAbsent(context.absentKey(), key -> key)).isEqualTo(context.absentKey());
   }
 
-  @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void computeIfAbsent_present(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.computeIfAbsent(key, k -> { throw new AssertionError(); }), is(value));
-    }
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(map.size(), is(context.original().size()));
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(count)));
-    assertThat(context, both(hasLoadSuccessCount(0)).and(hasLoadFailureCount(0)));
-  }
-
-  @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void computeIfAbsent_absent(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.computeIfAbsent(context.absentKey(),
-        key -> context.absentValue()), is(context.absentValue()));
-    assertThat(context, both(hasMissCount(1)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(1)).and(hasLoadFailureCount(0)));
-    assertThat(map.get(context.absentKey()), is(context.absentValue()));
-    assertThat(map.size(), is(1 + context.original().size()));
-  }
-
-  /* ---------------- computeIfPresent -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void computeIfPresent_nullKey(Map<Integer, Integer> map, CacheContext context) {
-    map.computeIfPresent(null, (key, value) -> -key);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void computeIfPresent_nullMappingFunction(Map<Integer, Integer> map, CacheContext context) {
-    map.computeIfPresent(1, null);
-  }
-
-  @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void computeIfPresent_nullValue(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      map.computeIfPresent(key, (k, v) -> null);
-    }
-
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(map.size(), is(context.original().size() - count));
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(0)).and(hasLoadFailureCount(count)));
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.EXPLICIT));
-  }
-
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = StackOverflowError.class)
-  public void computeIfPresent_recursive(Map<Integer, Integer> map, CacheContext context) {
-    // As we cannot provide immediate checking without an expensive solution, e.g. ThreadLocal,
-    // instead we assert that a stack overflow error will occur to inform the developer (vs
-    // a live-lock or deadlock alternative).
-    BiFunction<Integer, Integer, Integer> mappingFunction =
-        new BiFunction<Integer, Integer, Integer>() {
-          boolean recursed;
-
-          @Override public Integer apply(Integer key, Integer value) {
-            if (recursed) {
-              throw new StackOverflowError();
-            }
-            recursed = true;
-            return map.computeIfPresent(key, this);
-          }
-        };
-    map.computeIfPresent(context.firstKey(), mappingFunction);
-  }
-
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = StackOverflowError.class)
-  public void computeIfPresent_pingpong(Map<Integer, Integer> map, CacheContext context) {
-    // As we cannot provide immediate checking without an expensive solution, e.g. ThreadLocal,
-    // instead we assert that a stack overflow error will occur to inform the developer (vs
-    // a live-lock or deadlock alternative).
-    BiFunction<Integer, Integer, Integer> mappingFunction =
-        new BiFunction<Integer, Integer, Integer>() {
-          int recursed;
-
-          @Override public Integer apply(Integer key, Integer value) {
-            if (++recursed == 2) {
-              throw new StackOverflowError();
-            }
-            return map.computeIfPresent(context.lastKey(), this);
-          }
-        };
-    map.computeIfPresent(context.firstKey(), mappingFunction);
-  }
-
-  @CheckNoWriter
   @Test(dataProvider = "caches")
   @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void computeIfPresent_error(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.computeIfPresent(context.firstKey(), (key, value) -> { throw new Error(); });
-    } catch (Error e) {}
-    assertThat(map, is(equalTo(context.original())));
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(0)).and(hasLoadFailureCount(1)));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void computeIfPresent_absent(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.computeIfPresent(context.absentKey(), (key, value) -> value), is(nullValue()));
-    assertThat(map.get(context.absentKey()), is(nullValue()));
-    assertThat(map.size(), is(context.original().size()));
-  }
-
-  @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void computeIfPresent_present(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.computeIfPresent(key, (k, v) -> k), is(key));
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void computeIfAbsent_present(Map<Int, Int> map, CacheContext context) {
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map.computeIfAbsent(key, k -> { throw new AssertionError(); })).isEqualTo(value);
     }
+    assertThat(map).hasSize(context.initialSize());
     int count = context.firstMiddleLastKeys().size();
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(count)).and(hasLoadFailureCount(0)));
-
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.get(key), is(key));
-    }
-    assertThat(map.size(), is(context.original().size()));
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.REPLACED));
+    assertThat(context).stats().hits(count).misses(0).success(0).failures(0);
   }
 
-  /* ---------------- compute -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void compute_nullKey(Map<Integer, Integer> map, CacheContext context) {
-    map.compute(null, (key, value) -> -key);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void compute_nullMappingFunction(Map<Integer, Integer> map, CacheContext context) {
-    map.computeIfPresent(1, null);
-  }
-
-  @CheckNoWriter
   @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void compute_remove(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.compute(key, (k, v) -> null), is(nullValue()));
-    }
-
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(0)).and(hasLoadFailureCount(count)));
-
-    assertThat(map.size(), is(context.original().size() - count));
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.EXPLICIT));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void computeIfAbsent_absent(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.computeIfAbsent(context.absentKey(), key -> context.absentValue()))
+        .isEqualTo(context.absentValue());
+    assertThat(context).stats().hits(0).misses(1).success(1).failures(0);
+    assertThat(map).containsEntry(context.absentKey(), context.absentValue());
+    assertThat(map).hasSize(context.initialSize() + 1);
   }
 
-  // FIXME: Requires JDK8 release with JDK-8062841 fix
-  @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(enabled = false, dataProvider = "caches", expectedExceptions = StackOverflowError.class)
-  public void compute_recursive(Map<Integer, Integer> map, CacheContext context) {
-    BiFunction<Integer, Integer, Integer> mappingFunction =
-        new BiFunction<Integer, Integer, Integer>() {
-          @Override public Integer apply(Integer key, Integer value) {
-            return map.compute(key, this);
-          }
-        };
-    map.compute(context.absentKey(), mappingFunction);
-  }
-
-  // FIXME: Requires JDK8 release with JDK-8062841 fix
-  @CheckNoStats
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(enabled = false, dataProvider = "caches", expectedExceptions = StackOverflowError.class)
-  public void compute_pingpong(Map<Integer, Integer> map, CacheContext context) {
-    BiFunction<Integer, Integer, Integer> mappingFunction =
-        new BiFunction<Integer, Integer, Integer>() {
-          @Override public Integer apply(Integer key, Integer value) {
-            return map.computeIfPresent(context.lastKey(), this);
-          }
-        };
-    map.computeIfPresent(context.firstKey(), mappingFunction);
-  }
-
-  @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void compute_error(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.compute(context.absentKey(), (key, value) -> { throw new Error(); });
-    } catch (Error e) {}
-    assertThat(map, is(equalTo(context.original())));
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(0)).and(hasLoadFailureCount(1)));
-  }
-
-  @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void compute_absent(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.compute(context.absentKey(),
-        (key, value) -> context.absentValue()), is(context.absentValue()));
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(1)).and(hasLoadFailureCount(0)));
-    assertThat(map.get(context.absentKey()), is(context.absentValue()));
-    assertThat(map.size(), is(1 + context.original().size()));
-  }
-
-  @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void compute_sameValue(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.compute(key, (k, v) -> v), is(value));
-    }
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(count)).and(hasLoadFailureCount(0)));
-
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.get(key), is(value));
-    }
-    assertThat(map.size(), is(context.original().size()));
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.REPLACED));
-  }
-
-  @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void compute_differentValue(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.compute(key, (k, v) -> k), is(key));
-    }
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(count)).and(hasLoadFailureCount(0)));
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.get(key), is(key));
-    }
-    assertThat(map.size(), is(context.original().size()));
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.REPLACED));
-  }
-
-  /* ---------------- merge -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void merge_nullKey(Map<Integer, Integer> map, CacheContext context) {
-    map.merge(null, 1, (key, value) -> -key);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void merge_nullValue(Map<Integer, Integer> map, CacheContext context) {
-    map.merge(1, null, (key, value) -> -key);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void merge_nullMappingFunction(Map<Integer, Integer> map, CacheContext context) {
-    map.merge(1, 1, null);
-  }
-
-  @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void merge_remove(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.merge(key, value, (k, v) -> null), is(nullValue()));
-    }
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(0)).and(hasLoadFailureCount(count)));
-
-    assertThat(map.size(), is(context.original().size() - count));
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.EXPLICIT));
-  }
-
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches")
-  public void merge_recursive(Map<Integer, Integer> map, CacheContext context) {
-    BiFunction<Integer, Integer, Integer> mappingFunction =
-        new BiFunction<Integer, Integer, Integer>() {
-          @Override public Integer apply(Integer key, Integer value) {
-            return map.merge(key, -key, this);
-          }
-        };
-    Integer firstValue = context.original().get(context.firstKey());
-    Integer value = map.merge(context.absentKey(), firstValue, mappingFunction);
-    assertThat(value, is(firstValue));
-  }
-
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = StackOverflowError.class)
-  public void merge_pingpong(Map<Integer, Integer> map, CacheContext context) {
-    // As we cannot provide immediate checking without an expensive solution, e.g. ThreadLocal,
-    // instead we assert that a stack overflow error will occur to inform the developer (vs
-    // a live-lock or deadlock alternative).
-    BiFunction<Integer, Integer, Integer> mappingFunction =
-        new BiFunction<Integer, Integer, Integer>() {
-          int recursed;
-
-          @Override public Integer apply(Integer key, Integer value) {
-            if (++recursed == 2) {
-              throw new StackOverflowError();
-            }
-            return map.merge(context.lastKey(), context.original().get(context.lastKey()), this);
-          }
-        };
-    map.merge(context.firstKey(), context.original().get(context.firstKey()), mappingFunction);
-  }
-
-  @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(implementation = Implementation.Guava,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void merge_error(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.merge(context.firstKey(), context.original().get(context.firstKey()),
-          (key, value) -> { throw new Error(); });
-    } catch (Error e) {}
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(0)).and(hasLoadFailureCount(1)));
-    assertThat(map, is(equalTo(context.original())));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void merge_absent(Map<Integer, Integer> map, CacheContext context) {
-    Integer result = map.merge(context.absentKey(), context.absentValue(), (key, value) -> value);
-    assertThat(result, is(context.absentValue()));
-
-    assertThat(map.get(context.absentKey()), is(context.absentValue()));
-    assertThat(map.size(), is(1 + context.original().size()));
-  }
-
-  @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void merge_sameValue(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.merge(key, -key, (k, v) -> k), is(value));
-    }
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(count)).and(hasLoadFailureCount(0)));
-    for (Integer key : context.firstMiddleLastKeys()) {
-      Integer value = context.original().get(key);
-      assertThat(map.get(key), is(value));
-    }
-    assertThat(map.size(), is(context.original().size()));
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.REPLACED));
-  }
-
-  @CheckNoWriter
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void merge_differentValue(Map<Integer, Integer> map, CacheContext context) {
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.merge(key, key, (k, v) -> k + v), is(0));
-    }
-    int count = context.firstMiddleLastKeys().size();
-    assertThat(context, both(hasMissCount(0)).and(hasHitCount(0)));
-    assertThat(context, both(hasLoadSuccessCount(count)).and(hasLoadFailureCount(0)));
-
-    for (Integer key : context.firstMiddleLastKeys()) {
-      assertThat(map.get(key), is(0));
-    }
-    assertThat(map.size(), is(context.original().size()));
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.REPLACED));
-  }
-
-  /* ---------------- equals / hashCode -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void equals_null(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.equals(null), is(false));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void equals_self(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.equals(map), is(true));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void equals(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.equals(context.original()), is(true));
-    assertThat(context.original().equals(map), is(true));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void hashCode(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.hashCode(), is(equalTo(context.original().hashCode())));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void hashCode_self(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.hashCode(), is(equalTo(map.hashCode())));
-  }
-
-  @CheckNoWriter @CheckNoStats
   @Test(dataProvider = "caches")
   @CacheSpec(population = Population.EMPTY,
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void equalsAndHashCodeFail_empty(Map<Integer, Integer> map, CacheContext context) {
-    Map<Integer, Integer> other = ImmutableMap.of(1, -1, 2, -2, 3, -3);
-    assertThat(map.equals(other), is(false));
-    assertThat(other.equals(map), is(false));
-    assertThat(map.hashCode(), is(not(equalTo(other.hashCode()))));
-  }
+      removalListener = {Listener.DISABLED, Listener.REJECTING})
+  public void computeIfAbsent_async_null(AsyncCache<Int, Int> cache, CacheContext context) {
+    Int key = context.absentKey();
+    Int newValue = context.absentValue();
+    var future = new CompletableFuture<Int>();
 
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void equalsAndHashCodeFail_present(Map<Integer, Integer> map, CacheContext context) {
-    Map<Integer, Integer> other = ImmutableMap.of(1, -1, 2, -2, 3, -3);
-    assertThat(map.equals(other), is(false));
-    assertThat(other.equals(map), is(false));
-    assertThat(map.hashCode(), is(not(equalTo(other.hashCode()))));
-
-    Map<Integer, Integer> empty = ImmutableMap.of();
-    assertThat(map.equals(empty), is(false));
-    assertThat(empty.equals(map), is(false));
-    assertThat(map.hashCode(), is(not(equalTo(empty.hashCode()))));
-  }
-
-  /* ---------------- toString -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void toString(Map<Integer, Integer> map, CacheContext context) {
-    String toString = map.toString();
-    if (!context.original().toString().equals(toString)) {
-      for (Entry<Integer, Integer> entry : map.entrySet()) {
-        assertThat(toString, containsString(entry.getKey() + "=" + entry.getValue()));
-      }
-    }
-  }
-
-  /* ---------------- Key Set -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void keySetToArray_null(Map<Integer, Integer> map, CacheContext context) {
-    map.keySet().toArray(null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void keySetToArray(Map<Integer, Integer> map, CacheContext context) {
-    int length = context.original().size();
-
-    Integer[] ints = map.keySet().toArray(new Integer[length]);
-    assertThat(ints.length, is(length));
-    assertThat(Arrays.asList(ints).containsAll(context.original().keySet()), is(true));
-
-    Object[] array = map.keySet().toArray();
-    assertThat(array.length, is(length));
-    assertThat(Arrays.asList(array).containsAll(context.original().keySet()), is(true));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = Population.EMPTY,
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void keySet_whenEmpty(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.keySet(), is(deeplyEmpty()));
-  }
-
-  @CacheSpec
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = UnsupportedOperationException.class)
-  public void keySet_addNotSupported(Map<Integer, Integer> map, CacheContext context) {
-    map.keySet().add(1);
-  }
-
-  @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = DeleteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void keySet_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.keySet().clear();
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
-  }
-
-  @CacheSpec
-  @CheckNoStats
-  @Test(dataProvider = "caches")
-  public void keySet_clear(Map<Integer, Integer> map, CacheContext context) {
-    map.keySet().clear();
-    assertThat(map, is(emptyMap()));
-    int count = context.original().size();
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.EXPLICIT));
-    verifyWriter(context, (verifier, writer) -> {
-      verifier.deletedAll(context.original(), RemovalCause.EXPLICIT);
+    cache.put(key, future);
+    var start = new AtomicBoolean();
+    var done = new AtomicBoolean();
+    ConcurrentTestHarness.execute(() -> {
+      start.set(true);
+      Int result = cache.synchronous().asMap().computeIfAbsent(key, k -> newValue);
+      assertThat(result).isEqualTo(newValue);
+      done.set(true);
     });
+
+    await().untilTrue(start);
+    future.complete(null);
+
+    await().untilTrue(done);
+    assertThat(cache).containsEntry(key, newValue);
   }
 
-  @CacheSpec
+  /* --------------- computeIfPresent --------------- */
+
   @CheckNoStats
   @Test(dataProvider = "caches")
-  public void keySet(Map<Integer, Integer> map, CacheContext context) {
-    Set<Integer> keys = map.keySet();
-    assertThat(keys.contains(new Object()), is(false));
-    assertThat(keys.remove(new Object()), is(false));
-    assertThat(keys, hasSize(context.original().size()));
-    for (Integer key : keys) {
-      assertThat(keys.contains(key), is(true));
-      assertThat(keys.remove(key), is(true));
-      assertThat(keys.remove(key), is(false));
-      assertThat(keys.contains(key), is(false));
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void computeIfPresent_nullKey(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () ->
+        map.computeIfPresent(null, (key, value) -> key.negate()));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void computeIfPresent_nullMappingFunction(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.computeIfPresent(Int.valueOf(1), null));
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void computeIfPresent_nullValue(Map<Int, Int> map, CacheContext context) {
+    var removed = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      map.computeIfPresent(key, (k, v) -> null);
+      removed.put(key, context.original().get(key));
     }
-    assertThat(map, is(emptyMap()));
-    verifyWriter(context, (verifier, writer) -> verifier.deletedAll(context.original(), RemovalCause.EXPLICIT));
+
+    int count = context.firstMiddleLastKeys().size();
+    assertThat(map).hasSize(context.initialSize() - count);
+    assertThat(context).stats().hits(0).misses(0).success(0).failures(count);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(removed).exclusively();
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void computeIfPresent_recursive(Map<Int, Int> map, CacheContext context) {
+    // As we cannot provide immediate checking without an expensive solution, e.g. ThreadLocal,
+    // instead we assert that a stack overflow error will occur to inform the developer (vs
+    // a live-lock or deadlock alternative).
+    var mappingFunction = new BiFunction<Int, Int, Int>() {
+      boolean recursed;
+
+      @Override public Int apply(Int key, Int value) {
+        if (recursed) {
+          throw new StackOverflowError();
+        }
+        recursed = true;
+        return map.computeIfPresent(key, this);
+      }
+    };
+    assertThrows(StackOverflowError.class, () ->
+        map.computeIfPresent(context.firstKey(), mappingFunction));
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void computeIfPresent_pingpong(Map<Int, Int> map, CacheContext context) {
+    // As we cannot provide immediate checking without an expensive solution, e.g. ThreadLocal,
+    // instead we assert that a stack overflow error will occur to inform the developer (vs
+    // a live-lock or deadlock alternative).
+    var mappingFunction = new BiFunction<Int, Int, Int>() {
+      int recursed;
+
+      @Override public Int apply(Int key, Int value) {
+        if (++recursed == 2) {
+          throw new StackOverflowError();
+        }
+        return map.computeIfPresent(context.lastKey(), this);
+      }
+    };
+    assertThrows(StackOverflowError.class, () ->
+        map.computeIfPresent(context.firstKey(), mappingFunction));
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void computeIfPresent_error(Map<Int, Int> map, CacheContext context) {
+    assertThrows(ExpectedError.class, () ->
+        map.computeIfPresent(context.firstKey(), (key, value) -> { throw new ExpectedError(); }));
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).stats().hits(0).misses(0).success(0).failures(1);
+    assertThat(map.computeIfPresent(context.firstKey(), (k, v) -> k.negate()))
+        .isEqualTo(context.firstKey().negate());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void computeIfPresent_absent(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.computeIfPresent(context.absentKey(), (key, value) -> value)).isNull();
+    assertThat(map).doesNotContainKey(context.absentKey());
+    assertThat(map).hasSize(context.initialSize());
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void computeIfPresent_present_sameValue(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      var value = intern(new Int(context.original().get(key)));
+      assertThat(map.computeIfPresent(key, (k, v) -> value)).isSameInstanceAs(value);
+      replaced.put(key, value);
+    }
+    int count = context.firstMiddleLastKeys().size();
+    assertThat(context).stats().hits(0).misses(0).success(count).failures(0);
+
+    assertThat(map).hasSize(context.initialSize());
+    assertThat(map).containsAtLeastEntriesIn(replaced);
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(replaced).exclusively();
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void computeIfPresent_present_sameInstance(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map.computeIfPresent(key, (k, v) -> v))
+          .isSameInstanceAs(context.original().get(key));
+      replaced.put(key, context.original().get(key));
+    }
+    int count = context.firstMiddleLastKeys().size();
+    assertThat(context).stats().hits(0).misses(0).success(count).failures(0);
+
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map).containsEntry(key, context.original().get(key));
+    }
+    assertThat(map).hasSize(context.initialSize());
+
+    if (context.isGuava()) {
+      assertThat(context).removalNotifications().withCause(REPLACED)
+          .contains(replaced).exclusively();
+    } else {
+      assertThat(context).removalNotifications().isEmpty();
+    }
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void computeIfPresent_present_differentValue(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map.computeIfPresent(key, (k, v) -> k)).isEqualTo(key);
+      replaced.put(key, context.original().get(key));
+    }
+    int count = context.firstMiddleLastKeys().size();
+    assertThat(context).stats().hits(0).misses(0).success(count).failures(0);
+
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map).containsEntry(key, key);
+    }
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(replaced).exclusively();
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = {Listener.DISABLED, Listener.REJECTING})
+  public void computeIfPresent_async_null(AsyncCache<Int, Int> cache, CacheContext context) {
+    Int key = context.absentKey();
+    Int newValue = context.absentValue();
+    var future = new CompletableFuture<Int>();
+
+    cache.put(key, future);
+    var start = new AtomicBoolean();
+    var done = new AtomicBoolean();
+    ConcurrentTestHarness.execute(() -> {
+      start.set(true);
+      Int result = cache.synchronous().asMap().computeIfPresent(key, (k, oldValue) -> newValue);
+      assertThat(result).isNull();
+      done.set(true);
+    });
+
+    await().untilTrue(start);
+    future.complete(null);
+
+    await().untilTrue(done);
+    assertThat(cache).doesNotContainKey(key);
+  }
+
+  /* --------------- compute --------------- */
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void compute_nullKey(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.compute(null, (key, value) -> key.negate()));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void compute_nullMappingFunction(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.compute(Int.valueOf(1), null));
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void compute_remove(Map<Int, Int> map, CacheContext context) {
+    var removed = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map.compute(key, (k, v) -> null)).isNull();
+      removed.put(key, context.original().get(key));
+    }
+
+    int count = context.firstMiddleLastKeys().size();
+    assertThat(map).hasSize(context.initialSize() - count);
+    assertThat(context).stats().hits(0).misses(0).success(0).failures(count);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(removed).exclusively();
+  }
+
+  @CacheSpec
+  @Test(dataProvider = "caches")
+  public void compute_recursive(Map<Int, Int> map, CacheContext context) {
+    var mappingFunction = new BiFunction<Int, Int, Int>() {
+      @Override public Int apply(Int key, Int value) {
+        return map.compute(key, this);
+      }
+    };
+    var error = assertThrows(Throwable.class,
+        () -> map.compute(context.absentKey(), mappingFunction));
+    assertThat(error.getClass()).isAnyOf(StackOverflowError.class, IllegalStateException.class);
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY)
+  public void compute_pingpong(Map<Int, Int> map, CacheContext context) {
+    var key1 = Int.valueOf(1);
+    var key2 = Int.valueOf(2);
+    var mappingFunction = new BiFunction<Int, Int, Int>() {
+      @Override public Int apply(Int key, Int value) {
+        return map.compute(key.equals(key1) ? key2 : key1, this);
+      }
+    };
+    var error = assertThrows(Throwable.class, () -> map.compute(key1, mappingFunction));
+    assertThat(error.getClass()).isAnyOf(StackOverflowError.class, IllegalStateException.class);
+  }
+
+  @CacheSpec
+  @Test(dataProvider = "caches")
+  public void compute_error(Map<Int, Int> map, CacheContext context) {
+    assertThrows(IllegalStateException.class, () ->
+        map.compute(context.absentKey(), (key, value) -> { throw new IllegalStateException(); }));
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).stats().hits(0).misses(0).success(0).failures(1);
+    assertThat(map.compute(context.absentKey(), (k, v) -> intern(k.negate())))
+        .isEqualTo(context.absentKey().negate());
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void compute_absent_nullValue(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.compute(context.absentKey(), (key, value) -> null)).isNull();
+    assertThat(context).stats().hits(0).misses(0).success(0).failures(1);
+    assertThat(map.get(context.absentKey())).isNull();
+    assertThat(map).hasSize(context.initialSize());
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void compute_absent(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.compute(context.absentKey(), (key, value) -> context.absentValue()))
+        .isEqualTo(context.absentValue());
+    assertThat(context).stats().hits(0).misses(0).success(1).failures(0);
+    assertThat(map).containsEntry(context.absentKey(), context.absentValue());
+    assertThat(map).hasSize(1 + context.initialSize());
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void compute_sameValue(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = intern(new Int(context.original().get(key)));
+      assertThat(map.compute(key, (k, v) -> value)).isSameInstanceAs(value);
+      replaced.put(key, value);
+    }
+    int count = context.firstMiddleLastKeys().size();
+    assertThat(context).stats().hits(0).misses(0).success(count).failures(0);
+
+    assertThat(map).hasSize(context.initialSize());
+    assertThat(map).containsAtLeastEntriesIn(replaced);
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(replaced).exclusively();
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void compute_sameInstance(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map.compute(key, (k, v) -> value)).isSameInstanceAs(value);
+      replaced.put(key, value);
+    }
+    int count = context.firstMiddleLastKeys().size();
+    assertThat(context).stats().hits(0).misses(0).success(count).failures(0);
+
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map).containsEntry(key, value);
+    }
+    assertThat(map).hasSize(context.initialSize());
+
+    if (context.isGuava()) {
+      assertThat(context).removalNotifications().withCause(REPLACED)
+          .contains(replaced).exclusively();
+    } else {
+      assertThat(context).removalNotifications().isEmpty();
+    }
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void compute_differentValue(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map.compute(key, (k, v) -> k)).isEqualTo(key);
+      replaced.put(key, context.original().get(key));
+    }
+    int count = context.firstMiddleLastKeys().size();
+    assertThat(context).stats().hits(0).misses(0).success(count).failures(0);
+
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map).containsEntry(key, key);
+    }
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(replaced).exclusively();
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = {Listener.DISABLED, Listener.REJECTING})
+  public void compute_async_null(
+      AsyncCache<Int, Int> cache, CacheContext context) {
+    Int key = context.absentKey();
+    Int newValue = context.absentValue();
+    var future = new CompletableFuture<Int>();
+
+    cache.put(key, future);
+    var start = new AtomicBoolean();
+    var done = new AtomicBoolean();
+    ConcurrentTestHarness.execute(() -> {
+      start.set(true);
+      Int result = cache.synchronous().asMap().compute(key, (k, oldValue) -> newValue);
+      assertThat(result).isEqualTo(newValue);
+      done.set(true);
+    });
+
+    await().untilTrue(start);
+    future.complete(null);
+
+    await().untilTrue(done);
+    assertThat(cache).containsEntry(key, newValue);
+  }
+
+  /* --------------- merge --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void merge_nullKey(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () ->
+        map.merge(null, Int.valueOf(1), (oldValue, value) -> oldValue.negate()));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void merge_nullValue(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () ->
+        map.merge(Int.valueOf(1), null, (oldValue, value) -> oldValue.negate()));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void merge_nullMappingFunction(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.merge(Int.valueOf(1), Int.valueOf(1), null));
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void merge_remove(Map<Int, Int> map, CacheContext context) {
+    var removed = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map.merge(key, value, (oldValue, v) -> null)).isNull();
+      removed.put(key, value);
+    }
+    int count = context.firstMiddleLastKeys().size();
+    assertThat(map).hasSize(context.initialSize() - count);
+    assertThat(context).stats().hits(0).misses(0).success(0).failures(count);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(removed).exclusively();
+  }
+
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  @Test(dataProvider = "caches")
+  public void merge_recursive(Map<Int, Int> map, CacheContext context) {
+    var mappingFunction = new BiFunction<Int, Int, Int>() {
+      @Override public Int apply(Int oldValue, Int value) {
+        return map.merge(oldValue, oldValue.negate(), this);
+      }
+    };
+    Int firstValue = context.original().get(context.firstKey());
+    Int value = map.merge(context.absentKey(), firstValue, mappingFunction);
+    assertThat(value).isEqualTo(firstValue);
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void merge_pingpong(Map<Int, Int> map, CacheContext context) {
+    // As we cannot provide immediate checking without an expensive solution, e.g. ThreadLocal,
+    // instead we assert that a stack overflow error will occur to inform the developer (vs
+    // a live-lock or deadlock alternative).
+    var mappingFunction = new BiFunction<Int, Int, Int>() {
+      int recursed;
+
+      @Override public Int apply(Int oldValue, Int value) {
+        if (++recursed == 2) {
+          throw new StackOverflowError();
+        }
+        return map.merge(context.lastKey(), context.original().get(context.lastKey()), this);
+      }
+    };
+    assertThrows(StackOverflowError.class, () ->
+        map.merge(context.firstKey(), context.original().get(context.firstKey()), mappingFunction));
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void merge_error(Map<Int, Int> map, CacheContext context) {
+    assertThrows(ExpectedError.class, () ->
+        map.merge(context.firstKey(), context.original().get(context.firstKey()),
+            (oldValue, value) -> { throw new ExpectedError(); }));
+    assertThat(map).containsExactlyEntriesIn(context.original());
+    assertThat(context).stats().hits(0).misses(0).success(0).failures(1);
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void merge_absent(Map<Int, Int> map, CacheContext context) {
+    Int result = map.merge(context.absentKey(),
+        context.absentValue(), (oldValue, value) -> value);
+    assertThat(result).isEqualTo(context.absentValue());
+
+    assertThat(map).containsEntry(context.absentKey(), context.absentValue());
+    assertThat(map).hasSize(1 + context.initialSize());
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void merge_sameValue(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = intern(new Int(context.original().get(key)));
+      assertThat(map.merge(key, key.negate(), (oldValue, v) -> value)).isSameInstanceAs(value);
+      replaced.put(key, value);
+    }
+    int count = context.firstMiddleLastKeys().size();
+    assertThat(context).stats().hits(0).misses(0).success(count).failures(0);
+
+    assertThat(map).hasSize(context.initialSize());
+    assertThat(map).containsAtLeastEntriesIn(replaced);
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(replaced).exclusively();
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void merge_sameInstance(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map.merge(key, key.negate(), (oldValue, v) -> value)).isSameInstanceAs(value);
+      replaced.put(key, value);
+    }
+    int count = context.firstMiddleLastKeys().size();
+    assertThat(context).stats().hits(0).misses(0).success(count).failures(0);
+
+    for (Int key : context.firstMiddleLastKeys()) {
+      Int value = context.original().get(key);
+      assertThat(map).containsEntry(key, value);
+    }
+    assertThat(map).hasSize(context.initialSize());
+
+    if (context.isGuava()) {
+      assertThat(context).removalNotifications().withCause(REPLACED)
+          .contains(replaced).exclusively();
+    } else {
+      assertThat(context).removalNotifications().isEmpty();
+    }
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void merge_differentValue(Map<Int, Int> map, CacheContext context) {
+    var replaced = new HashMap<Int, Int>();
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map.merge(key, key, (oldValue, v) -> intern(oldValue.add(v)))).isEqualTo(0);
+      replaced.put(key, context.original().get(key));
+    }
+    int count = context.firstMiddleLastKeys().size();
+    assertThat(context).stats().hits(0).misses(0).success(count).failures(0);
+
+    for (Int key : context.firstMiddleLastKeys()) {
+      assertThat(map).containsEntry(key, Int.valueOf(0));
+    }
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(replaced).exclusively();
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = {Listener.DISABLED, Listener.REJECTING})
+  public void merge_async_null(
+      AsyncCache<Int, Int> cache, CacheContext context) {
+    Int key = context.absentKey();
+    Int newValue = context.absentValue();
+    var future = new CompletableFuture<Int>();
+
+    cache.put(key, future);
+    var start = new AtomicBoolean();
+    var done = new AtomicBoolean();
+    ConcurrentTestHarness.execute(() -> {
+      start.set(true);
+      Int result = cache.synchronous().asMap()
+          .merge(key, newValue, (k, oldValue) -> newValue.add(1));
+      assertThat(result).isEqualTo(newValue);
+      done.set(true);
+    });
+
+    await().untilTrue(start);
+    future.complete(null);
+
+    await().untilTrue(done);
+    assertThat(cache).containsEntry(key, newValue);
+  }
+
+  /* --------------- equals / hashCode --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void equals_null(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.equals(null)).isFalse();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @SuppressWarnings("SelfEquals")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void equals_self(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.equals(map)).isTrue();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void equals(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.equals(context.original())).isTrue();
+    assertThat(context.original().equals(map)).isTrue();
+
+    assertThat(map.equals(context.absent())).isFalse();
+    assertThat(context.absent().equals(map)).isFalse();
+
+    if (!map.isEmpty()) {
+      var other = ImmutableMap.copyOf(Maps.transformValues(map, Int::negate));
+      assertThat(map.equals(other)).isFalse();
+      assertThat(other.equals(map)).isFalse();
+    }
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void hashCode(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.hashCode()).isEqualTo(context.original().hashCode());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void hashCode_self(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.hashCode()).isEqualTo(map.hashCode());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void equalsAndHashCodeFail_empty(Map<Int, Int> map, CacheContext context) {
+    var other = Int.mapOf(1, -1, 2, -2, 3, -3);
+    assertThat(map.equals(other)).isFalse();
+    assertThat(other.equals(map)).isFalse();
+    assertThat(map.hashCode()).isNotEqualTo(other.hashCode());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void equalsAndHashCodeFail_present(Map<Int, Int> map, CacheContext context) {
+    var other = Int.mapOf(1, -1, 2, -2, 3, -3);
+    assertThat(map.equals(other)).isFalse();
+    assertThat(other.equals(map)).isFalse();
+    assertThat(map.hashCode()).isNotEqualTo(other.hashCode());
+
+    Map<Int, Int> empty = Map.of();
+    assertThat(map.equals(empty)).isFalse();
+    assertThat(empty.equals(map)).isFalse();
+    assertThat(map.hashCode()).isNotEqualTo(empty.hashCode());
+  }
+
+  /* --------------- toString --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void toString(Map<Int, Int> map, CacheContext context) {
+    assertThat(parseToString(map)).containsExactlyEntriesIn(parseToString(context.original()));
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(implementation = Implementation.Caffeine)
+  public void toString_self(Map<Object, Object> map, CacheContext context) {
+    map.put(context.absentKey(), map);
+    assertThat(map.toString()).contains(context.absentKey() + "=(this Map)");
+  }
+
+  private static Map<String, String> parseToString(Map<Int, Int> map) {
+    return Splitter.on(',').trimResults().omitEmptyStrings().withKeyValueSeparator("=")
+        .split(map.toString().replaceAll("\\{|\\}", ""));
+  }
+
+  /* --------------- Key Set --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void keySet_toArray_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.keySet().toArray((Int[]) null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void keySet_toArray(Map<Int, Int> map, CacheContext context) {
+    var array = map.keySet().toArray();
+    assertThat(array).asList().containsExactlyElementsIn(context.original().keySet());
+
+    var ints = map.keySet().toArray(new Int[0]);
+    assertThat(ints).asList().containsExactlyElementsIn(context.original().keySet());
+
+    var func = map.keySet().toArray(Int[]::new);
+    assertThat(func).asList().containsExactlyElementsIn(context.original().keySet());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void keySet_contains_absent(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.keySet().contains(context.absentKey())).isFalse();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void keySet_contains_present(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.keySet().contains(context.firstKey())).isTrue();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void keySet_contains_inFlight(AsyncCache<Int, Int> cache, CacheContext context) {
+    var future = new CompletableFuture<Int>();
+    cache.put(context.absentKey(), future);
+    assertThat(cache.synchronous().asMap().keySet().contains(context.absentKey())).isFalse();
+    cache.synchronous().invalidate(context.absentKey());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void keySet_whenEmpty(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.keySet()).isExhaustivelyEmpty();
   }
 
   @CacheSpec
   @CheckNoStats
   @Test(dataProvider = "caches")
-  public void keySet_iterator(Map<Integer, Integer> map, CacheContext context) {
+  public void keySet_addNotSupported(Map<Int, Int> map, CacheContext context) {
+    assertThrows(UnsupportedOperationException.class, () -> map.keySet().add(Int.valueOf(1)));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_clear(Map<Int, Int> map, CacheContext context) {
+    map.keySet().clear();
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_removeAll_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.keySet().removeAll(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_removeAll_nullKey(Map<Int, Int> map, CacheContext context) {
+    map.keySet().removeAll(Collections.singletonList((Object) null));
+    assertThat(map).isEqualTo(context.original());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_removeAll_none_empty(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.keySet().removeAll(Set.of())).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_removeAll_none_populated(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.keySet().removeAll(Set.of(context.absentKey()))).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void keySet_removeAll_partial(Map<Int, Int> map, CacheContext context) {
+    var expected = new HashMap<>(context.original());
+    expected.keySet().removeAll(context.firstMiddleLastKeys());
+    assertThat(map.keySet().removeAll(context.firstMiddleLastKeys())).isTrue();
+    assertThat(map).isEqualTo(expected);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(Maps.toMap(context.firstMiddleLastKeys(),
+            key -> requireNonNull(context.original().get(key))))
+        .exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void keySet_removeAll_all(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.keySet().removeAll(context.original().keySet())).isTrue();
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void keySet_removeAll_self(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.keySet().removeAll(map.keySet())).isTrue();
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL, implementation = Implementation.Caffeine)
+  public void keySet_removeAll_byCollection(Map<Int, Int> map, CacheContext context) {
+    var delegate = Sets.union(context.original().keySet(), context.absentKeys());
+    Collection<Int> keys = Mockito.mock();
+    when(keys.iterator()).thenReturn(delegate.iterator());
+
+    assertThat(map.keySet().removeAll(keys)).isTrue();
+    verify(keys).iterator();
+    verifyNoMoreInteractions(keys);
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL, implementation = Implementation.Caffeine)
+  public void keySet_removeAll_bySet(Map<Int, Int> map, CacheContext context) {
+    var delegate = Sets.union(context.original().keySet(), context.absentKeys());
+    Set<Int> keys = Mockito.mock();
+    when(keys.size()).thenReturn(delegate.size());
+    when(keys.contains(any())).then(invocation -> delegate.contains(invocation.getArgument(0)));
+
+    assertThat(map.keySet().removeAll(keys)).isTrue();
+    verify(keys).size();
+    verify(keys, times(context.original().size())).contains(any());
+    verifyNoMoreInteractions(keys);
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_remove_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.keySet().remove(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_remove_none(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.keySet().remove(context.absentKey())).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void keySet_remove(Map<Int, Int> map, CacheContext context) {
+    var expected = new HashMap<>(context.original());
+    expected.remove(context.firstKey());
+
+    assertThat(map.keySet().remove(context.firstKey())).isTrue();
+    assertThat(map).isEqualTo(expected);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.firstKey(), context.original().get(context.firstKey())).exclusively();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_removeIf_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.keySet().removeIf(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_removeIf_none(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.keySet().removeIf(v -> false)).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_removeIf_partial(Map<Int, Int> map, CacheContext context) {
+    Predicate<Int> isEven = key -> (key.intValue() % 2) == 0;
+    boolean hasEven = map.keySet().stream().anyMatch(isEven);
+
+    boolean removedIfEven = map.keySet().removeIf(isEven);
+    assertThat(map.keySet().stream().anyMatch(isEven)).isFalse();
+    assertThat(removedIfEven).isEqualTo(hasEven);
+    if (removedIfEven) {
+      assertThat(map).hasSizeLessThan(context.initialSize());
+    }
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_removeIf_all(Map<Int, Int> map, CacheContext context) {
+    if (context.population() == Population.EMPTY) {
+      assertThat(map.keySet().removeIf(v -> true)).isFalse();
+      assertThat(map).isEqualTo(context.original());
+      assertThat(context).removalNotifications().isEmpty();
+    } else {
+      assertThat(map.keySet().removeIf(v -> true)).isTrue();
+      assertThat(map).isExhaustivelyEmpty();
+      assertThat(context).removalNotifications().withCause(EXPLICIT).contains(context.original());
+    }
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_retainAll_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.keySet().retainAll(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_retainAll_nullKey(Map<Int, Int> map, CacheContext context) {
+    map.keySet().retainAll(Collections.singletonList((Object) null));
+    assertThat(map).isExhaustivelyEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_retainAll_none_empty(Map<Int, Int> map, CacheContext context) {
+    boolean modified = map.keySet().retainAll(Set.of());
+    assertThat(map).isExhaustivelyEmpty();
+    if (context.original().isEmpty()) {
+      assertThat(modified).isFalse();
+      assertThat(context).removalNotifications().isEmpty();
+    } else {
+      assertThat(modified).isTrue();
+      assertThat(context).removalNotifications().withCause(EXPLICIT)
+          .contains(context.original()).exclusively();
+    }
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void keySet_retainAll_none_populated(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.keySet().retainAll(Set.of(context.absentKey()))).isTrue();
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void keySet_retainAll_partial(Map<Int, Int> map, CacheContext context) {
+    var expected = new HashMap<>(context.original());
+    expected.keySet().removeAll(context.firstMiddleLastKeys());
+    assertThat(map.keySet().retainAll(expected.keySet())).isTrue();
+    assertThat(map).isEqualTo(expected);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(Maps.toMap(context.firstMiddleLastKeys(),
+            key -> requireNonNull(context.original().get(key))))
+        .exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void keySet_retainAll_all(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.keySet().retainAll(context.original().keySet())).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void keySet_retainAll_self(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.keySet().retainAll(map.keySet())).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet(Map<Int, Int> map, CacheContext context) {
+    var keys = map.keySet();
+    assertThat(keys).doesNotContain(new Object());
+    assertThat(keys.remove(new Object())).isFalse();
+    assertThat(keys).hasSize(context.initialSize());
+    for (Int key : Set.copyOf(keys)) {
+      assertThat(keys).contains(key);
+      assertThat(keys.remove(key)).isTrue();
+      assertThat(keys.remove(key)).isFalse();
+      assertThat(keys).doesNotContain(key);
+    }
+    assertThat(map).isExhaustivelyEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySet_iterator(Map<Int, Int> map, CacheContext context) {
     int iterations = 0;
-    for (Iterator<Integer> i = map.keySet().iterator(); i.hasNext();) {
-      assertThat(map.containsKey(i.next()), is(true));
+    for (var i = map.keySet().iterator(); i.hasNext();) {
+      assertThat(map).containsKey(i.next());
       iterations++;
       i.remove();
     }
-    assertThat(map, hasRemovalNotifications(context, iterations, RemovalCause.EXPLICIT));
-    assertThat(iterations, is(context.original().size()));
-    assertThat(map, is(emptyMap()));
-    verifyWriter(context, (verifier, writer) -> verifier.deletedAll(context.original(), RemovalCause.EXPLICIT));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(population = Population.EMPTY,
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = IllegalStateException.class)
-  public void keyIterator_noElement(Map<Integer, Integer> map, CacheContext context) {
-    map.keySet().iterator().remove();
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(population = Population.EMPTY,
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NoSuchElementException.class)
-  public void keyIterator_noMoreElements(Map<Integer, Integer> map, CacheContext context) {
-    map.keySet().iterator().next();
+    int count = iterations;
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(count).isEqualTo(context.initialSize());
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
   }
 
   @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = DeleteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void keyIterator_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      Iterator<Integer> i = map.keySet().iterator();
-      i.next();
-      i.remove();
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void keyIterator_noElement(Map<Int, Int> map, CacheContext context) {
+    assertThrows(IllegalStateException.class, () -> map.keySet().iterator().remove());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void keyIterator_noMoreElements(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NoSuchElementException.class, () -> map.keySet().iterator().next());
   }
 
   @CacheSpec
-  @CheckNoWriter @CheckNoStats
+  @CheckNoStats
   @Test(dataProvider = "caches")
-  public void keySpliterator(Map<Integer, Integer> map, CacheContext context) {
+  public void keySpliterator_forEachRemaining_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () ->
+        map.keySet().spliterator().forEachRemaining(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySpliterator_forEachRemaining(Map<Int, Int> map, CacheContext context) {
     int[] count = new int[1];
     map.keySet().spliterator().forEachRemaining(key -> count[0]++);
-    assertThat(count[0], is(map.size()));
-  }
-
-  /* ---------------- Values -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void valuesToArray_null(Map<Integer, Integer> map, CacheContext context) {
-    map.values().toArray(null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void valuesToArray(Map<Integer, Integer> map, CacheContext context) {
-    int length = context.original().size();
-
-    Integer[] ints = map.values().toArray(new Integer[length]);
-    assertThat(ints.length, is(length));
-    assertThat(Arrays.asList(ints).containsAll(context.original().values()), is(true));
-
-    Object[] array = map.values().toArray();
-    assertThat(array.length, is(length));
-    assertThat(Arrays.asList(array).containsAll(context.original().values()), is(true));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = Population.EMPTY,
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void values_empty(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.values(), is(deeplyEmpty()));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(population = Population.EMPTY,
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = UnsupportedOperationException.class)
-  public void values_addNotSupported(Map<Integer, Integer> map, CacheContext context) {
-    map.values().add(1);
-  }
-
-  @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = DeleteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void values_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.values().clear();
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
+    assertThat(count[0]).isEqualTo(context.initialSize());
   }
 
   @CacheSpec
   @CheckNoStats
   @Test(dataProvider = "caches")
-  public void values_clear(Map<Integer, Integer> map, CacheContext context) {
+  public void keySpliterator_tryAdvance_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.keySet().spliterator().tryAdvance(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySpliterator_tryAdvance(Map<Int, Int> map, CacheContext context) {
+    var spliterator = map.keySet().spliterator();
+    int[] count = new int[1];
+    boolean advanced;
+    do {
+      advanced = spliterator.tryAdvance(key -> count[0]++);
+    } while (advanced);
+    assertThat(count[0]).isEqualTo(context.initialSize());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySpliterator_trySplit(Map<Int, Int> map, CacheContext context) {
+    var spliterator = map.keySet().spliterator();
+    var other = firstNonNull(spliterator.trySplit(), Spliterators.emptySpliterator());
+
+    int[] count = new int[1];
+    spliterator.forEachRemaining(key -> count[0]++);
+    other.forEachRemaining(key -> count[0]++);
+    assertThat(count[0]).isEqualTo(context.initialSize());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void keySpliterator_estimateSize(Map<Int, Int> map, CacheContext context) {
+    var spliterator = map.keySet().spliterator();
+    assertThat(spliterator.estimateSize()).isEqualTo(context.initialSize());
+  }
+
+  /* --------------- Values --------------- */
+
+  @CheckNoStats
+  @SuppressWarnings("NullAway")
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void values_toArray_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.values().toArray((Int[]) null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void values_toArray(Map<Int, Int> map, CacheContext context) {
+    var array = map.values().toArray();
+    assertThat(array).asList().containsExactlyElementsIn(context.original().values());
+
+    var ints = map.values().toArray(new Int[0]);
+    assertThat(ints).asList().containsExactlyElementsIn(context.original().values());
+
+    var func = map.values().toArray(Int[]::new);
+    assertThat(func).asList().containsExactlyElementsIn(context.original().values());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void values_contains_absent(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values().contains(context.absentValue())).isFalse();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void values_contains_present(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values().contains(context.original().get(context.firstKey()))).isTrue();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void values_empty(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values()).isExhaustivelyEmpty();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void values_addNotSupported(Map<Int, Int> map, CacheContext context) {
+    assertThrows(UnsupportedOperationException.class, () -> map.values().add(Int.valueOf(1)));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values_clear(Map<Int, Int> map, CacheContext context) {
     map.values().clear();
-    assertThat(map, is(emptyMap()));
-    int count = context.original().size();
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.EXPLICIT));
-    verifyWriter(context, (verifier, writer) -> {
-      verifier.deletedAll(context.original(), RemovalCause.EXPLICIT);
-    });
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
   }
 
   @CacheSpec
   @CheckNoStats
   @Test(dataProvider = "caches")
-  public void values(Map<Integer, Integer> map, CacheContext context) {
-    Collection<Integer> values = map.values();
-    assertThat(values.contains(new Object()), is(false));
-    assertThat(values.remove(new Object()), is(false));
-    assertThat(values, hasSize(context.original().size()));
-    for (Integer value : values) {
-      assertThat(values.contains(value), is(true));
-      assertThat(values.remove(value), is(true));
-      assertThat(values.remove(value), is(false));
-      assertThat(values.contains(value), is(false));
+  public void values_removeAll_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.values().removeAll(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values_removeAll_nullValue(Map<Int, Int> map, CacheContext context) {
+    map.values().removeAll(Collections.singletonList((Object) null));
+    assertThat(map).isEqualTo(context.original());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values_removeAll_none_empty(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values().removeAll(Set.of())).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values_removeAll_none_populated(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values().removeAll(Set.of(context.absentValue()))).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void values_removeAll_partial(Map<Int, Int> map, CacheContext context) {
+    var expected = new HashMap<>(context.original());
+    expected.keySet().removeAll(context.firstMiddleLastKeys());
+    var removed = Maps.toMap(context.firstMiddleLastKeys(),
+        key -> requireNonNull(context.original().get(key)));
+
+    assertThat(map.values().removeAll(removed.values())).isTrue();
+    assertThat(map).isEqualTo(expected);
+    assertThat(context).removalNotifications().withCause(EXPLICIT).contains(removed).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void values_removeAll_all(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values().removeAll(context.original().values())).isTrue();
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void values_removeAll_self(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values().removeAll(map.values())).isTrue();
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values_remove_null(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values().remove(null)).isFalse();
+    assertThat(map).isEqualTo(context.original());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values_remove_none(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values().remove(context.absentValue())).isFalse();
+    assertThat(map).isEqualTo(context.original());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void values_remove(Map<Int, Int> map, CacheContext context) {
+    var value = context.original().get(context.firstKey());
+    assertThat(map.values().remove(value)).isTrue();
+    var expected = new HashMap<>(context.original());
+    expected.remove(context.firstKey());
+    assertThat(map).isEqualTo(expected);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.firstKey(), value).exclusively();
+  }
+
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void values_remove_once(Map<Int, Int> map, CacheContext context) {
+    var expected = new HashMap<>(context.original());
+    for (Int key : context.firstMiddleLastKeys()) {
+      expected.put(key, context.absentValue());
+      map.put(key, context.absentValue());
     }
-    assertThat(map, is(emptyMap()));
-    int count = context.original().size();
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.EXPLICIT));
-    verifyWriter(context, (verifier, writer) -> verifier.deletedAll(context.original(), RemovalCause.EXPLICIT));
+    context.clearRemovalNotifications();
+
+    assertThat(map.values().remove(context.absentValue())).isTrue();
+    var removedKey = context.firstMiddleLastKeys().stream()
+        .filter(key -> !map.containsKey(key))
+        .findAny().orElseThrow();
+    expected.remove(removedKey);
+    assertThat(map).isEqualTo(expected);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(removedKey, context.absentValue()).exclusively();
   }
 
   @CacheSpec
   @CheckNoStats
   @Test(dataProvider = "caches")
-  public void valueIterator(Map<Integer, Integer> map, CacheContext context) {
+  public void values_removeIf_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.values().removeIf(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values_removeIf_none(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values().removeIf(v -> false)).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values_removeIf_partial(Map<Int, Int> map, CacheContext context) {
+    Predicate<Int> isEven = value -> (value.intValue() % 2) == 0;
+    boolean hasEven = map.values().stream().anyMatch(isEven);
+
+    boolean removedIfEven = map.values().removeIf(isEven);
+    assertThat(map.values().stream().anyMatch(isEven)).isFalse();
+    assertThat(removedIfEven).isEqualTo(hasEven);
+    if (removedIfEven) {
+      assertThat(map.size()).isLessThan(context.original().size());
+    }
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values_removeIf_all(Map<Int, Int> map, CacheContext context) {
+    if (context.population() == Population.EMPTY) {
+      assertThat(map.values().removeIf(v -> true)).isFalse();
+      assertThat(map).isEqualTo(context.original());
+      assertThat(context).removalNotifications().isEmpty();
+    } else {
+      assertThat(map.values().removeIf(v -> true)).isTrue();
+      assertThat(map).isExhaustivelyEmpty();
+      assertThat(context).removalNotifications().withCause(EXPLICIT).contains(context.original());
+    }
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values_retainAll_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.values().retainAll(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values_retainAll_nullValue(Map<Int, Int> map, CacheContext context) {
+    map.values().retainAll(Collections.singletonList((Object) null));
+    assertThat(map).isExhaustivelyEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values_retainAll_none_empty(Map<Int, Int> map, CacheContext context) {
+    boolean modified = map.values().retainAll(Set.of());
+    assertThat(map).isExhaustivelyEmpty();
+    if (context.original().isEmpty()) {
+      assertThat(modified).isFalse();
+      assertThat(context).removalNotifications().isEmpty();
+    } else {
+      assertThat(modified).isTrue();
+      assertThat(context).removalNotifications().withCause(EXPLICIT)
+          .contains(context.original()).exclusively();
+    }
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void values_retainAll_none_populated(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values().retainAll(Set.of(context.absentValue()))).isTrue();
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void values_retainAll_partial(Map<Int, Int> map, CacheContext context) {
+    var expected = new HashMap<>(context.original());
+    expected.keySet().removeAll(context.firstMiddleLastKeys());
+    var removed = Maps.toMap(context.firstMiddleLastKeys(),
+        key -> requireNonNull(context.original().get(key)));
+
+    assertThat(map.values().retainAll(expected.values())).isTrue();
+    assertThat(map).isEqualTo(expected);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(removed).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void values_retainAll_all(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values().retainAll(context.original().values())).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void values_retainAll_self(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.values().retainAll(map.values())).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void values(Map<Int, Int> map, CacheContext context) {
+    var values = map.values();
+    assertThat(values).doesNotContain(new Object());
+    assertThat(values.remove(new Object())).isFalse();
+    assertThat(values).hasSize(context.initialSize());
+    for (Int value : List.copyOf(values)) {
+      assertThat(values).contains(value);
+      assertThat(values.remove(value)).isTrue();
+      assertThat(values.remove(value)).isFalse();
+      assertThat(values).doesNotContain(value);
+    }
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void valueIterator(Map<Int, Int> map, CacheContext context) {
     int iterations = 0;
-    for (Iterator<Integer> i = map.values().iterator(); i.hasNext();) {
-      assertThat(map.containsValue(i.next()), is(true));
+    for (var i = map.values().iterator(); i.hasNext();) {
+      assertThat(map.values()).contains(i.next());
       iterations++;
       i.remove();
     }
-    assertThat(map, hasRemovalNotifications(context, iterations, RemovalCause.EXPLICIT));
-    assertThat(iterations, is(context.original().size()));
-    assertThat(map, is(emptyMap()));
-    verifyWriter(context, (verifier, writer) -> verifier.deletedAll(context.original(), RemovalCause.EXPLICIT));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(population = Population.EMPTY,
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = IllegalStateException.class)
-  public void valueIterator_noElement(Map<Integer, Integer> map, CacheContext context) {
-    map.values().iterator().remove();
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(population = Population.EMPTY,
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NoSuchElementException.class)
-  public void valueIterator_noMoreElements(Map<Integer, Integer> map, CacheContext context) {
-    map.values().iterator().next();
+    int count = iterations;
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(count).isEqualTo(context.initialSize());
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
   }
 
   @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = DeleteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void valueIterator_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      Iterator<Integer> i = map.values().iterator();
-      i.next();
-      i.remove();
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void valueIterator_noElement(Map<Int, Int> map, CacheContext context) {
+    assertThrows(IllegalStateException.class, () -> map.values().iterator().remove());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void valueIterator_noMoreElements(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NoSuchElementException.class, () -> map.values().iterator().next());
   }
 
   @CacheSpec
-  @CheckNoWriter @CheckNoStats
+  @CheckNoStats
   @Test(dataProvider = "caches")
-  public void valueSpliterator(Map<Integer, Integer> map, CacheContext context) {
+  public void valueSpliterator_forEachRemaining_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () ->
+        map.values().spliterator().forEachRemaining(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void valueSpliterator_forEachRemaining(Map<Int, Int> map, CacheContext context) {
     int[] count = new int[1];
-    map.values().spliterator().forEachRemaining(key -> count[0]++);
-    assertThat(count[0], is(map.size()));
-  }
-
-  /* ---------------- Entry Set -------------- */
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  public void entrySetToArray_null(Map<Integer, Integer> map, CacheContext context) {
-    map.entrySet().toArray(null);
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void entriesToArray(Map<Integer, Integer> map, CacheContext context) {
-    int length = context.original().size();
-
-    Object[] ints = map.entrySet().toArray(new Object[length]);
-    assertThat(ints.length, is(length));
-    assertThat(Arrays.asList(ints).containsAll(context.original().entrySet()), is(true));
-
-    Object[] array = map.entrySet().toArray();
-    assertThat(array.length, is(length));
-    assertThat(Arrays.asList(array).containsAll(context.original().entrySet()), is(true));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(population = Population.EMPTY,
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  public void entrySet_empty(Map<Integer, Integer> map, CacheContext context) {
-    assertThat(map.entrySet(), is(deeplyEmpty()));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(population = Population.EMPTY, removalListener = Listener.DEFAULT)
-  @Test(dataProvider = "caches", expectedExceptions = UnsupportedOperationException.class)
-  public void entrySet_addIsNotSupported(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.entrySet().add(immutableEntry(1, 2));
-    } finally {
-      assertThat(map.size(), is(0));
-    }
-  }
-
-  @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = DeleteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void entrySet_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      map.entrySet().clear();
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
+    map.values().spliterator().forEachRemaining(value -> count[0]++);
+    assertThat(count[0]).isEqualTo(context.initialSize());
   }
 
   @CacheSpec
   @CheckNoStats
   @Test(dataProvider = "caches")
-  public void entrySet_clear(Map<Integer, Integer> map, CacheContext context) {
+  public void valueSpliterator_tryAdvance_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.values().spliterator().tryAdvance(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void valueSpliterator_tryAdvance(Map<Int, Int> map, CacheContext context) {
+    var spliterator = map.values().spliterator();
+    int[] count = new int[1];
+    boolean advanced;
+    do {
+      advanced = spliterator.tryAdvance(value -> count[0]++);
+    } while (advanced);
+    assertThat(count[0]).isEqualTo(context.initialSize());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void valueSpliterator_trySplit(Map<Int, Int> map, CacheContext context) {
+    var spliterator = map.values().spliterator();
+    var other = firstNonNull(spliterator.trySplit(), Spliterators.emptySpliterator());
+
+    int[] count = new int[1];
+    spliterator.forEachRemaining(value -> count[0]++);
+    other.forEachRemaining(value -> count[0]++);
+    assertThat(count[0]).isEqualTo(context.initialSize());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void valueSpliterator_estimateSize(Map<Int, Int> map, CacheContext context) {
+    var spliterator = map.values().spliterator();
+    assertThat(spliterator.estimateSize()).isEqualTo(context.initialSize());
+  }
+
+  /* --------------- Entry Set --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void entrySet_toArray_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () ->
+        map.entrySet().toArray((Map.Entry<?, ?>[]) null));
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void entrySet_toArray(Map<Int, Int> map, CacheContext context) {
+    var array = map.entrySet().toArray();
+    assertThat(array).asList().containsExactlyElementsIn(context.original().entrySet());
+
+    var ints = map.entrySet().toArray(new Map.Entry<?, ?>[0]);
+    assertThat(ints).asList().containsExactlyElementsIn(context.original().entrySet());
+
+    var func = map.entrySet().toArray(Map.Entry<?, ?>[]::new);
+    assertThat(func).asList().containsExactlyElementsIn(context.original().entrySet());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void entrySet_contains_nullKey(Map<Int, Int> map, CacheContext context) {
+    var entry = new AbstractMap.SimpleEntry<>(null, context.original().get(context.firstKey()));
+    assertThat(map.entrySet().contains(entry)).isFalse();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void entrySet_contains_nullValue(Map<Int, Int> map, CacheContext context) {
+    var entry = new AbstractMap.SimpleEntry<>(context.firstKey(), null);
+    assertThat(map.entrySet().contains(entry)).isFalse();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void entrySet_contains_absent(Map<Int, Int> map, CacheContext context) {
+    var entry = Map.entry(context.absentKey(), context.absentValue());
+    assertThat(map.entrySet().contains(entry)).isFalse();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void entrySet_contains_present(Map<Int, Int> map, CacheContext context) {
+    var entry = Map.entry(context.firstKey(), context.original().get(context.firstKey()));
+    assertThat(map.entrySet().contains(entry)).isTrue();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void entrySet_empty(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.entrySet()).isExhaustivelyEmpty();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY, removalListener = Listener.DISABLED)
+  public void entrySet_addIsNotSupported(Map<Int, Int> map, CacheContext context) {
+    assertThrows(UnsupportedOperationException.class, () ->
+        map.entrySet().add(Map.entry(Int.valueOf(1), Int.valueOf(2))));
+    assertThat(map).isExhaustivelyEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet_clear(Map<Int, Int> map, CacheContext context) {
     map.entrySet().clear();
-    assertThat(map, is(emptyMap()));
-    int count = context.original().size();
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.EXPLICIT));
-    verifyWriter(context, (verifier, writer) -> {
-      verifier.deletedAll(context.original(), RemovalCause.EXPLICIT);
-    });
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
   }
 
   @CacheSpec
   @CheckNoStats
   @Test(dataProvider = "caches")
-  public void entrySet(Map<Integer, Integer> map, CacheContext context) {
-    Set<Entry<Integer, Integer>> entries = map.entrySet();
-    assertThat(entries.contains(new Object()), is(false));
-    assertThat(entries.remove(new Object()), is(false));
-    assertThat(entries, hasSize(context.original().size()));
-    for (Entry<Integer, Integer> entry : entries) {
-      assertThat(entries.contains(entry), is(true));
-      assertThat(entries.remove(entry), is(true));
-      assertThat(entries.remove(entry), is(false));
-      assertThat(entries.contains(entry), is(false));
+  public void entrySet_removeAll_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.entrySet().removeAll(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet_removeAll_nullEntry(Map<Int, Int> map, CacheContext context) {
+    map.entrySet().removeAll(Collections.singletonList((Object) null));
+    assertThat(map).isEqualTo(context.original());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet_removeAll_none_empty(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.entrySet().removeAll(Set.of())).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet_removeAll_none_populated(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.entrySet().removeAll(
+        Set.of(Map.entry(context.absentKey(), context.absentKey())))).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void entrySet_removeAll_partial(Map<Int, Int> map, CacheContext context) {
+    var removed = Maps.toMap(context.firstMiddleLastKeys(),
+        key -> requireNonNull(context.original().get(key)));
+    var expected = new HashMap<>(context.original());
+    expected.entrySet().removeAll(removed.entrySet());
+
+    assertThat(map.entrySet().removeAll(removed.entrySet())).isTrue();
+    assertThat(map).isEqualTo(expected);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(removed).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void entrySet_removeAll_all(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.entrySet().removeAll(context.original().entrySet())).isTrue();
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void entrySet_removeAll_self(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.entrySet().removeAll(map.entrySet())).isTrue();
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL, implementation = Implementation.Caffeine)
+  public void entrySet_removeAll_byCollection(Map<Int, Int> map, CacheContext context) {
+    var delegate = Sets.union(context.original().entrySet(), context.absent().entrySet());
+    Collection<Map.Entry<Int, Int>> entries = Mockito.mock();
+    when(entries.iterator()).thenReturn(delegate.iterator());
+
+    assertThat(map.entrySet().removeAll(entries)).isTrue();
+    verify(entries).iterator();
+    verifyNoMoreInteractions(entries);
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL, implementation = Implementation.Caffeine)
+  public void entrySet_removeAll_bySet(Map<Int, Int> map, CacheContext context) {
+    var delegate = Sets.union(context.original().entrySet(), context.absent().entrySet());
+    Set<Map.Entry<Int, Int>> entries = Mockito.mock();
+    when(entries.size()).thenReturn(delegate.size());
+    when(entries.contains(any())).then(invocation -> delegate.contains(invocation.getArgument(0)));
+
+    assertThat(map.entrySet().removeAll(entries)).isTrue();
+    verify(entries).size();
+    verify(entries, times(context.original().size())).contains(any());
+    verifyNoMoreInteractions(entries);
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet_remove_null(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.entrySet().remove(null)).isFalse();
+    assertThat(map).isEqualTo(context.original());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @SuppressWarnings("MapEntry")
+  @Test(dataProvider = "caches")
+  public void entrySet_remove_nullKey(Map<Int, Int> map, CacheContext context) {
+    var value = Iterables.getFirst(context.original().values(), context.absentValue());
+    assertThat(map.entrySet().remove(Maps.immutableEntry(null, value))).isFalse();
+    assertThat(map).isEqualTo(context.original());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @SuppressWarnings("MapEntry")
+  @Test(dataProvider = "caches")
+  public void entrySet_remove_nullValue(Map<Int, Int> map, CacheContext context) {
+    var key = Iterables.getFirst(context.original().keySet(), context.absentKey());
+    assertThat(map.entrySet().remove(Maps.immutableEntry(key, null))).isFalse();
+    assertThat(map).isEqualTo(context.original());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @SuppressWarnings("MapEntry")
+  @Test(dataProvider = "caches")
+  public void entrySet_remove_nullKeyValue(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.entrySet().remove(Maps.immutableEntry(null, null))).isFalse();
+    assertThat(map).isEqualTo(context.original());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet_remove_none(Map<Int, Int> map, CacheContext context) {
+    var entry = Map.entry(context.absentKey(), context.absentValue());
+    assertThat(map.entrySet().remove(entry)).isFalse();
+    assertThat(map).isEqualTo(context.original());
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void entrySet_remove(Map<Int, Int> map, CacheContext context) {
+    var entry = Map.entry(context.firstKey(), context.original().get(context.firstKey()));
+    assertThat(map.entrySet().remove(entry)).isTrue();
+
+    var expected = new HashMap<>(context.original());
+    expected.remove(context.firstKey());
+    assertThat(map).isEqualTo(expected);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(entry).exclusively();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet_removeIf_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.entrySet().removeIf(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet_removeIf_none(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.entrySet().removeIf(v -> false)).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet_removeIf_partial(Map<Int, Int> map, CacheContext context) {
+    Predicate<Map.Entry<Int, Int>> isEven = entry -> (entry.getValue().intValue() % 2) == 0;
+    boolean hasEven = map.entrySet().stream().anyMatch(isEven);
+
+    boolean removedIfEven = map.entrySet().removeIf(isEven);
+    assertThat(map.entrySet().stream().anyMatch(isEven)).isFalse();
+    assertThat(removedIfEven).isEqualTo(hasEven);
+    if (removedIfEven) {
+      assertThat(map).hasSizeLessThan(context.initialSize());
     }
-    assertThat(map, is(emptyMap()));
-    int count = context.original().size();
-    assertThat(map, hasRemovalNotifications(context, count, RemovalCause.EXPLICIT));
-    verifyWriter(context, (verifier, writer) -> verifier.deletedAll(context.original(), RemovalCause.EXPLICIT));
   }
 
   @CacheSpec
   @CheckNoStats
   @Test(dataProvider = "caches")
-  public void entryIterator(Map<Integer, Integer> map, CacheContext context) {
+  public void entrySet_removeIf_all(Map<Int, Int> map, CacheContext context) {
+    if (context.population() == Population.EMPTY) {
+      assertThat(map.entrySet().removeIf(v -> true)).isFalse();
+      assertThat(map).isEqualTo(context.original());
+      assertThat(context).removalNotifications().isEmpty();
+    } else {
+      assertThat(map.entrySet().removeIf(v -> true)).isTrue();
+      assertThat(map).isExhaustivelyEmpty();
+      assertThat(context).removalNotifications().withCause(EXPLICIT).contains(context.original());
+    }
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet_retainAll_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.entrySet().retainAll(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet_retainAll_nullEntry(Map<Int, Int> map, CacheContext context) {
+    map.entrySet().retainAll(Collections.singletonList((Object) null));
+    assertThat(map).isExhaustivelyEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet_retainAll_none_empty(Map<Int, Int> map, CacheContext context) {
+    boolean modified = map.entrySet().retainAll(Set.of());
+    assertThat(map).isExhaustivelyEmpty();
+    if (context.original().isEmpty()) {
+      assertThat(modified).isFalse();
+      assertThat(context).removalNotifications().isEmpty();
+    } else {
+      assertThat(modified).isTrue();
+      assertThat(context).removalNotifications().withCause(EXPLICIT)
+          .contains(context.original()).exclusively();
+    }
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void entrySet_retainAll_none_populated(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.entrySet().retainAll(
+        Set.of(Map.entry(context.absentKey(), context.absentValue())))).isTrue();
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void entrySet_retainAll_partial(Map<Int, Int> map, CacheContext context) {
+    var removed = Maps.toMap(context.firstMiddleLastKeys(),
+        key -> requireNonNull(context.original().get(key)));
+    var expected = new HashMap<>(context.original());
+    expected.entrySet().removeAll(removed.entrySet());
+
+    assertThat(map.entrySet().retainAll(expected.entrySet())).isTrue();
+    assertThat(map).isEqualTo(expected);
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(removed).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void entrySet_retainAll_all(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.entrySet().retainAll(context.original().entrySet())).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.FULL)
+  public void entrySet_retainAll_self(Map<Int, Int> map, CacheContext context) {
+    assertThat(map.entrySet().retainAll(map.entrySet())).isFalse();
+    assertThat(map).isEqualTo(context.original());
+    assertThat(context).removalNotifications().isEmpty();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySet(Map<Int, Int> map, CacheContext context) {
+    var entries = map.entrySet();
+    assertThat(entries).doesNotContain(new Object());
+    assertThat(entries.remove(new Object())).isFalse();
+    assertThat(entries).hasSize(context.initialSize());
+    entries.forEach(entry -> {
+      assertThat(entries).contains(entry);
+      assertThat(entries.remove(entry)).isTrue();
+      assertThat(entries.remove(entry)).isFalse();
+      assertThat(entries).doesNotContain(entry);
+    });
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entryIterator(Map<Int, Int> map, CacheContext context) {
     int iterations = 0;
-    for (Iterator<Entry<Integer, Integer>> i = map.entrySet().iterator(); i.hasNext();) {
-      Entry<Integer, Integer> entry = i.next();
-      assertThat(map, hasEntry(entry.getKey(), entry.getValue()));
+    for (var i = map.entrySet().iterator(); i.hasNext();) {
+      var entry = i.next();
+      assertThat(map).containsEntry(entry.getKey(), entry.getValue());
       iterations++;
       i.remove();
     }
-    assertThat(map, hasRemovalNotifications(context, iterations, RemovalCause.EXPLICIT));
-    assertThat(iterations, is(context.original().size()));
-    assertThat(map, is(emptyMap()));
-    verifyWriter(context, (verifier, writer) -> verifier.deletedAll(context.original(), RemovalCause.EXPLICIT));
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(population = Population.EMPTY,
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = IllegalStateException.class)
-  public void entryIterator_noElement(Map<Integer, Integer> map, CacheContext context) {
-    map.entrySet().iterator().remove();
-  }
-
-  @CheckNoWriter @CheckNoStats
-  @CacheSpec(population = Population.EMPTY,
-      removalListener = { Listener.DEFAULT, Listener.REJECTING })
-  @Test(dataProvider = "caches", expectedExceptions = NoSuchElementException.class)
-  public void entryIterator_noMoreElements(Map<Integer, Integer> map, CacheContext context) {
-    map.entrySet().iterator().next();
+    int count = iterations;
+    assertThat(map).isExhaustivelyEmpty();
+    assertThat(count).isEqualTo(context.initialSize());
+    assertThat(context).removalNotifications().withCause(EXPLICIT)
+        .contains(context.original()).exclusively();
   }
 
   @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = DeleteException.class)
-  @CacheSpec(implementation = Implementation.Caffeine, keys = ReferenceType.STRONG,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL },
-      compute = Compute.SYNC, writer = Writer.EXCEPTIONAL, removalListener = Listener.REJECTING)
-  public void entryIterator_writerFails(Map<Integer, Integer> map, CacheContext context) {
-    try {
-      Iterator<Entry<Integer, Integer>> i = map.entrySet().iterator();
-      i.next();
-      i.remove();
-    } finally {
-      assertThat(map, equalTo(context.original()));
-    }
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void entryIterator_noElement(Map<Int, Int> map, CacheContext context) {
+    assertThrows(IllegalStateException.class, () -> map.entrySet().iterator().remove());
   }
 
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = Population.EMPTY,
+      removalListener = { Listener.DISABLED, Listener.REJECTING })
+  public void entryIterator_noMoreElements(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NoSuchElementException.class, () -> map.entrySet().iterator().next());
+  }
 
   @CacheSpec
-  @CheckNoWriter @CheckNoStats
+  @CheckNoStats
   @Test(dataProvider = "caches")
-  public void entrySetSpliterator(Map<Integer, Integer> map, CacheContext context) {
-    int[] count = new int[1];
-    map.entrySet().spliterator().forEachRemaining(key -> count[0]++);
-    assertThat(count[0], is(map.size()));
+  public void entrySpliterator_forEachRemaining_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () ->
+        map.entrySet().spliterator().forEachRemaining(null));
   }
 
-  /* ---------------- WriteThroughEntry -------------- */
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySpliterator_forEachRemaining(Map<Int, Int> map, CacheContext context) {
+    int[] count = new int[1];
+    map.entrySet().spliterator().forEachRemaining(entry -> {
+      if (context.isCaffeine()) {
+        assertThat(entry).isInstanceOf(WriteThroughEntry.class);
+      }
+      count[0]++;
+      assertThat(context.original()).containsEntry(entry.getKey(), entry.getValue());
+    });
+    assertThat(count[0]).isEqualTo(context.initialSize());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySpliterator_tryAdvance_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.entrySet().spliterator().tryAdvance(null));
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySpliterator_tryAdvance(Map<Int, Int> map, CacheContext context) {
+    var spliterator = map.entrySet().spliterator();
+    int[] count = new int[1];
+    boolean advanced;
+    do {
+      advanced = spliterator.tryAdvance(entry -> {
+        if (context.isCaffeine()) {
+          assertThat(entry).isInstanceOf(WriteThroughEntry.class);
+        }
+        count[0]++;
+      });
+    } while (advanced);
+    assertThat(count[0]).isEqualTo(context.initialSize());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySpliterator_trySplit(Map<Int, Int> map, CacheContext context) {
+    var spliterator = map.entrySet().spliterator();
+    var other = firstNonNull(spliterator.trySplit(), Spliterators.emptySpliterator());
+
+    int[] count = new int[1];
+    spliterator.forEachRemaining(entry -> count[0]++);
+    other.forEachRemaining(entry -> count[0]++);
+    assertThat(count[0]).isEqualTo(context.initialSize());
+  }
+
+  @CacheSpec
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  public void entrySpliterator_estimateSize(Map<Int, Int> map, CacheContext context) {
+    var spliterator = map.entrySet().spliterator();
+    assertThat(spliterator.estimateSize()).isEqualTo(context.initialSize());
+  }
+
+  /* --------------- WriteThroughEntry --------------- */
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void writeThroughEntry(Map<Int, Int> map, CacheContext context) {
+    var entry = map.entrySet().iterator().next();
+    var oldValue = entry.getValue();
+
+    entry.setValue(Int.valueOf(3));
+    assertThat(map).hasSize(context.initialSize());
+    assertThat(map).containsEntry(entry.getKey(), Int.valueOf(3));
+    assertThat(context).removalNotifications().withCause(REPLACED)
+        .contains(entry.getKey(), oldValue).exclusively();
+  }
+
+  @CheckNoStats
+  @Test(dataProvider = "caches")
+  @CacheSpec(population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
+  public void writeThroughEntry_null(Map<Int, Int> map, CacheContext context) {
+    assertThrows(NullPointerException.class, () -> map.entrySet().iterator().next().setValue(null));
+  }
 
   @CheckNoStats
   @Test(dataProvider = "caches")
   @CacheSpec(implementation = Implementation.Caffeine,
       population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void writeThroughEntry(Map<Integer, Integer> map, CacheContext context) {
-    Entry<Integer, Integer> entry = map.entrySet().iterator().next();
-
-    entry.setValue(3);
-    assertThat(map.get(entry.getKey()), is(3));
-    assertThat(map.size(), is(context.original().size()));
-    assertThat(map, hasRemovalNotifications(context, 1, RemovalCause.REPLACED));
-    verifyWriter(context, (verifier, writer) -> verifier.wrote(entry.getKey(), 3));
+  public void writeThroughEntry_serialize(Map<Int, Int> map, CacheContext context) {
+    var entry = map.entrySet().iterator().next();
+    var copy = SerializableTester.reserialize(entry);
+    assertThat(entry).isEqualTo(copy);
   }
 
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches", expectedExceptions = NullPointerException.class)
-  @CacheSpec(implementation = Implementation.Caffeine,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void writeThroughEntry_null(Map<Integer, Integer> map, CacheContext context) {
-    map.entrySet().iterator().next().setValue(null);
+  @Test
+  public void writeThroughEntry_equals_hashCode_toString() {
+    var map = new ConcurrentHashMap<>();
+    var entry = new WriteThroughEntry<>(map, 1, 2);
+
+    assertThat(entry.equals(Map.entry(1, 2))).isTrue();
+    assertThat(entry.hashCode()).isEqualTo(Map.entry(1, 2).hashCode());
+    assertThat(entry.toString()).isEqualTo(Map.entry(1, 2).toString());
+
+    var other = new WriteThroughEntry<>(map, 3, 4);
+    assertThat(entry.equals(other)).isFalse();
+    assertThat(entry.hashCode()).isNotEqualTo(other.hashCode());
+    assertThat(entry.toString()).isNotEqualTo(other.toString());
   }
 
-  @CheckNoWriter @CheckNoStats
-  @Test(dataProvider = "caches")
-  @CacheSpec(implementation = Implementation.Caffeine,
-      population = { Population.SINGLETON, Population.PARTIAL, Population.FULL })
-  public void writeThroughEntry_serialize(Map<Integer, Integer> map, CacheContext context) {
-    Entry<Integer, Integer> entry = map.entrySet().iterator().next();
-    Object copy = SerializableTester.reserialize(entry);
-    assertThat(entry, is(equalTo(copy)));
+  @SuppressWarnings("PMD.DoNotExtendJavaLangError")
+  static final class ExpectedError extends Error {
+    private static final long serialVersionUID = 1L;
   }
 }

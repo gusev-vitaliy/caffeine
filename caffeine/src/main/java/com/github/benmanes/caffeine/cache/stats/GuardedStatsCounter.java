@@ -17,17 +17,20 @@ package com.github.benmanes.caffeine.cache.stats;
 
 import static java.util.Objects.requireNonNull;
 
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import java.lang.System.Logger;
+import java.lang.System.Logger.Level;
+
+import com.github.benmanes.caffeine.cache.RemovalCause;
 
 /**
  * A {@link StatsCounter} implementation that suppresses and logs any exception thrown by the
- * delegate <tt>statsCounter</tt>.
+ * delegate <code>statsCounter</code>.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@SuppressWarnings("PMD.AvoidDuplicateLiterals")
 final class GuardedStatsCounter implements StatsCounter {
-  static final Logger logger = Logger.getLogger(GuardedStatsCounter.class.getName());
+  static final Logger logger = System.getLogger(GuardedStatsCounter.class.getName());
 
   final StatsCounter delegate;
 
@@ -72,9 +75,10 @@ final class GuardedStatsCounter implements StatsCounter {
   }
 
   @Override
-  public void recordEviction() {
+  public void recordEviction(int weight, RemovalCause cause) {
+    requireNonNull(cause);
     try {
-      delegate.recordEviction();
+      delegate.recordEviction(weight, cause);
     } catch (Throwable t) {
       logger.log(Level.WARNING, "Exception thrown by stats counter", t);
     }
@@ -86,7 +90,12 @@ final class GuardedStatsCounter implements StatsCounter {
       return delegate.snapshot();
     } catch (Throwable t) {
       logger.log(Level.WARNING, "Exception thrown by stats counter", t);
-      return DisabledStatsCounter.EMPTY_STATS;
+      return CacheStats.empty();
     }
+  }
+
+  @Override
+  public String toString() {
+    return delegate.toString();
   }
 }

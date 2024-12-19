@@ -17,54 +17,122 @@ package com.github.benmanes.caffeine.cache.simulator.policy;
 
 import static java.util.Objects.requireNonNull;
 
-import com.github.benmanes.caffeine.cache.simulator.Simulator.Message;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Semaphore;
 
-import akka.actor.ActorRef;
-import akka.actor.UntypedActor;
-import akka.dispatch.BoundedMessageQueueSemantics;
-import akka.dispatch.RequiresMessageQueue;
-import it.unimi.dsi.fastutil.longs.LongArrayList;
+import org.jspecify.annotations.Nullable;
+
+import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
+import com.google.common.collect.ImmutableList;
 
 /**
  * An actor that proxies to the page replacement policy.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class PolicyActor extends UntypedActor
-    implements RequiresMessageQueue<BoundedMessageQueueSemantics> {
+public final class PolicyActor {
+  private final CompletableFuture<@Nullable Void> completed;
+  private final Semaphore semaphore;
   private final Policy policy;
+  private final Thread parent;
 
-  public PolicyActor(Policy policy) {
+  private CompletableFuture<@Nullable Void> future;
+
+  /**
+   * Creates an actor that executes the policy actions asynchronously over a buffered channel.
+   *
+   * @param parent the supervisor to interrupt if the policy fails
+   * @param policy the cache policy being simulated
+   * @param settings the simulation settings
+   */
+  public PolicyActor(Thread parent, Policy policy, BasicSettings settings) {
+    this.semaphore = new Semaphore(settings.actor().mailboxSize());
+    this.future = CompletableFuture.completedFuture(null);
+    this.completed = new CompletableFuture<>();
     this.policy = requireNonNull(policy);
+    this.parent = requireNonNull(parent);
   }
 
-  @Override
-  public void onReceive(Object msg) {
-    if (msg instanceof LongArrayList) {
-      LongArrayList events = (LongArrayList) msg;
-      process(events);
-    } else if (msg == Message.FINISH) {
-      policy.finished();
-      getSender().tell(policy.stats(), ActorRef.noSender());
-      getContext().stop(getSelf());
-    } else if (msg == Message.ERROR) {
-      getContext().stop(getSelf());
-    } else {
-      context().system().log().error("Invalid message: " + msg);
+  /** Sends the access events for async processing and blocks until accepted into the mailbox. */
+  public void send(ImmutableList<AccessEvent> events) {
+    submit(new Execute(events));
+  }
+
+  /** Sends a shutdown signal after the pending messages are completed. */
+  public void finish() {
+    submit(new Finish());
+  }
+
+  /** Return the future that signals the policy's completion. */
+  public CompletableFuture<@Nullable Void> completed() {
+    return completed;
+  }
+
+  /** Submits the command to the mailbox and blocks until accepted. */
+  private void submit(Command command) {
+    try {
+      semaphore.acquire();
+      future = future.thenRunAsync(command);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException(e);
     }
   }
 
-  private void process(LongArrayList events) {
-    policy.stats().stopwatch().start();
-    try {
-      for (int i = 0; i < events.size(); i++) {
-        policy.record(events.getLong(i));
+  /** Returns the cache efficiency statistics. */
+  public PolicyStats stats() {
+    return policy.stats();
+  }
+
+  /** A command to process the access events. */
+  private final class Execute extends Command {
+    final List<AccessEvent> events;
+
+    Execute(List<AccessEvent> events) {
+      this.events = requireNonNull(events);
+    }
+    @Override public void execute() {
+      policy.stats().stopwatch().start();
+      for (AccessEvent event : events) {
+        long priorMisses = policy.stats().missCount();
+        long priorHits = policy.stats().hitCount();
+        policy.record(event);
+
+        if (policy.stats().hitCount() > priorHits) {
+          policy.stats().recordHitPenalty(event.hitPenalty());
+        } else if (policy.stats().missCount() > priorMisses) {
+          policy.stats().recordMissPenalty(event.missPenalty());
+        }
       }
-    } catch (Exception e) {
-      context().system().log().error(e, "");
-      getSender().tell(Message.ERROR, ActorRef.noSender());
-    } finally {
       policy.stats().stopwatch().stop();
     }
+  }
+
+  /** A command to shut down the policy and finalize the statistics. */
+  private final class Finish extends Command {
+    @Override public void execute() {
+      policy.finished();
+      completed.complete(null);
+    }
+  }
+
+  private abstract class Command implements Runnable {
+    @SuppressWarnings("Interruption")
+    @Override public final void run() {
+      var name = Thread.currentThread().getName();
+      Thread.currentThread().setName(policy.getClass().getSimpleName());
+      try {
+        execute();
+      } catch (Throwable t) {
+        completed.completeExceptionally(t);
+        parent.interrupt();
+        throw t;
+      } finally {
+        semaphore.release();
+        Thread.currentThread().setName(name);
+      }
+    }
+    protected abstract void execute();
   }
 }

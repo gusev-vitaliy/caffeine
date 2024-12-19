@@ -15,21 +15,26 @@
  */
 package com.github.benmanes.caffeine.cache;
 
+import static com.github.benmanes.caffeine.cache.Caffeine.calculateHashMapCapacity;
+import static com.github.benmanes.caffeine.cache.LocalAsyncCache.composeResult;
 import static java.util.Objects.requireNonNull;
 
-import java.util.ArrayList;
-import java.util.Collection;
+import java.lang.System.Logger;
+import java.lang.System.Logger.Level;
+import java.lang.reflect.Method;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Map.Entry;
+import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.function.BiFunction;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+
+import org.jspecify.annotations.Nullable;
+
+import com.google.errorprone.annotations.Var;
 
 /**
  * This class provides a skeletal implementation of the {@link LoadingCache} interface to minimize
@@ -37,142 +42,189 @@ import java.util.logging.Logger;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-interface LocalLoadingCache<C extends LocalCache<K, V>, K, V>
-    extends LocalManualCache<C, K, V>, LoadingCache<K, V> {
-  Logger logger = Logger.getLogger(LocalLoadingCache.class.getName());
+interface LocalLoadingCache<K, V> extends LocalManualCache<K, V>, LoadingCache<K, V> {
+  Logger logger = System.getLogger(LocalLoadingCache.class.getName());
 
-  /** Returns the {@link CacheLoader} used by this cache. */
-  CacheLoader<? super K, V> cacheLoader();
+  /** Returns the {@link AsyncCacheLoader} used by this cache. */
+  AsyncCacheLoader<? super K, V> cacheLoader();
 
+  /** Returns the {@link CacheLoader#load} as a mapping function. */
   Function<K, V> mappingFunction();
 
-  /** Returns whether the cache loader supports bulk loading. */
-  boolean hasBulkLoader();
-
-  /** Returns whether the supplied cache loader has bulk load functionality. */
-  default boolean hasLoadAll(CacheLoader<? super K, V> loader) {
-    try {
-      return !loader.getClass().getMethod("loadAll", Iterable.class).isDefault();
-    } catch (NoSuchMethodException | SecurityException e) {
-      logger.log(Level.WARNING, "Cannot determine if CacheLoader can bulk load", e);
-      return false;
-    }
-  }
+  /** Returns the {@link CacheLoader#loadAll} as a mapping function, if implemented. */
+  @Nullable Function<Set<? extends K>, Map<K, V>> bulkMappingFunction();
 
   @Override
+  @SuppressWarnings("NullAway")
   default V get(K key) {
     return cache().computeIfAbsent(key, mappingFunction());
   }
 
   @Override
   default Map<K, V> getAll(Iterable<? extends K> keys) {
-    return hasBulkLoader() ? loadInBulk(keys) : loadSequentially(keys);
+    Function<Set<? extends K>, Map<K, V>> mappingFunction = bulkMappingFunction();
+    return (mappingFunction == null)
+        ? loadSequentially(keys)
+        : getAll(keys, mappingFunction);
   }
 
   /** Sequentially loads each missing entry. */
   default Map<K, V> loadSequentially(Iterable<? extends K> keys) {
-    int count = 0;
-    Map<K, V> result = new HashMap<>();
-    Iterator<? extends K> iter = keys.iterator();
-    while (iter.hasNext()) {
-      K key = iter.next();
-      count++;
-      try {
-        V value = get(key);
-        if (value != null) {
-          result.put(key, value);
-        }
-      } catch (Throwable t) {
-        int remaining;
-        if (keys instanceof Collection<?>) {
-          remaining = ((Collection<?>) keys).size() - count;
-        } else {
-          remaining = 0;
-          while (iter.hasNext()) {
-            remaining++;
-            iter.next();
-          }
-        }
-        cache().statsCounter().recordMisses(remaining);
-        throw t;
-      }
-    }
-    return Collections.unmodifiableMap(result);
-  }
-
-  /** Batch loads the missing entries. */
-  default Map<K, V> loadInBulk(Iterable<? extends K> keys) {
-    Map<K, V> found = cache().getAllPresent(keys);
-    List<K> keysToLoad = new ArrayList<>();
+    var result = new LinkedHashMap<K, V>(calculateHashMapCapacity(keys));
     for (K key : keys) {
-      if (!found.containsKey(key)) {
-        keysToLoad.add(key);
-      }
-    }
-    if (keysToLoad.isEmpty()) {
-      return found;
+      result.put(key, null);
     }
 
-    Map<K, V> result = new HashMap<>(found);
-    bulkLoad(keysToLoad, result);
-    return Collections.unmodifiableMap(result);
-  }
-
-  /**
-   * Performs a non-blocking bulk load of the missing keys. Any missing entry that materializes
-   * during the load are replaced when the loaded entries are inserted into the cache.
-   */
-  default void bulkLoad(List<K> keysToLoad, Map<K, V> result) {
-    boolean success = false;
-    long startTime = cache().statsTicker().read();
+    @Var int count = 0;
     try {
-      @SuppressWarnings("unchecked")
-      Map<K, V> loaded = (Map<K, V>) cacheLoader().loadAll(keysToLoad);
-      for (Entry<K, V> entry : loaded.entrySet()) {
-        cache().put(entry.getKey(), entry.getValue(), false);
-      }
-      for (K key : keysToLoad) {
-        V value = loaded.get(key);
-        if (value != null) {
-          result.put(key, value);
+      for (var iter = result.entrySet().iterator(); iter.hasNext();) {
+        Map.Entry<K, V> entry = iter.next();
+        count++;
+
+        V value = get(entry.getKey());
+        if (value == null) {
+          iter.remove();
+        } else {
+          entry.setValue(value);
         }
       }
-      success = !loaded.isEmpty();
-    } catch (RuntimeException e) {
-      throw e;
-    } catch (Exception e) {
-      throw new CompletionException(e);
-    } finally {
-      long loadTime = cache().statsTicker().read() - startTime;
-      if (success) {
-        cache().statsCounter().recordLoadSuccess(loadTime);
-      } else {
-        cache().statsCounter().recordLoadFailure(loadTime);
-      }
+    } catch (Throwable t) {
+      cache().statsCounter().recordMisses(result.size() - count);
+      throw t;
     }
+    return Collections.unmodifiableMap(result);
   }
 
   @Override
-  default void refresh(K key) {
+  @SuppressWarnings("FutureReturnValueIgnored")
+  default CompletableFuture<V> refresh(K key) {
     requireNonNull(key);
-    cache().executor().execute(() -> {
-      BiFunction<? super K, ? super V, ? extends V> refreshFunction = (k, oldValue) -> {
-        try {
-          return (oldValue == null)
-              ? cacheLoader().load(key)
-              : cacheLoader().reload(key, oldValue);
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-          return LocalCache.throwUnchecked(e);
-        } catch (Exception e) {
-          return LocalCache.throwUnchecked(e);
-        }
-      };
+
+    long[] startTime = new long[1];
+    @SuppressWarnings({"unchecked", "Varifier"})
+    @Nullable V[] oldValue = (V[]) new Object[1];
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    CompletableFuture<? extends V>[] reloading = new CompletableFuture[1];
+    Object keyReference = cache().referenceKey(key);
+
+    var future = cache().refreshes().compute(keyReference, (k, existing) -> {
+      if ((existing != null) && !Async.isReady(existing) && !cache().isPendingEviction(key)) {
+        return existing;
+      }
+
       try {
-        cache().compute(key, refreshFunction, false, false);
-      } catch (Throwable t) {
-        logger.log(Level.WARNING, "Exception thrown during refresh", t);
+        startTime[0] = cache().statsTicker().read();
+        oldValue[0] = cache().getIfPresentQuietly(key);
+        var refreshFuture = (oldValue[0] == null)
+            ? cacheLoader().asyncLoad(key, cache().executor())
+            : cacheLoader().asyncReload(key, oldValue[0], cache().executor());
+        reloading[0] = requireNonNull(refreshFuture, "Null future");
+        return refreshFuture;
+      } catch (RuntimeException e) {
+        throw e;
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new CompletionException(e);
+      } catch (Exception e) {
+        throw new CompletionException(e);
       }
     });
+
+    if (reloading[0] != null) {
+      reloading[0].whenComplete((newValue, error) -> {
+        long loadTime = cache().statsTicker().read() - startTime[0];
+        if (error != null) {
+          if (!(error instanceof CancellationException) && !(error instanceof TimeoutException)) {
+            logger.log(Level.WARNING, "Exception thrown during refresh", error);
+          }
+          cache().refreshes().remove(keyReference, reloading[0]);
+          cache().statsCounter().recordLoadFailure(loadTime);
+          return;
+        }
+
+        boolean[] discard = new boolean[1];
+        var value = cache().compute(key, (k, currentValue) -> {
+          boolean removed = cache().refreshes().remove(keyReference, reloading[0]);
+          if (removed && (currentValue == oldValue[0])) {
+            return (currentValue == null) && (newValue == null) ? null : newValue;
+          }
+          discard[0] = (currentValue != newValue);
+          return currentValue;
+        }, cache().expiry(), /* recordLoad= */ false, /* recordLoadFailure= */ true);
+
+        if (discard[0] && (newValue != null)) {
+          var cause = (value == null) ? RemovalCause.EXPLICIT : RemovalCause.REPLACED;
+          cache().notifyRemoval(key, newValue, cause);
+        }
+        if (newValue == null) {
+          cache().statsCounter().recordLoadFailure(loadTime);
+        } else {
+          cache().statsCounter().recordLoadSuccess(loadTime);
+        }
+      });
+    }
+
+    @SuppressWarnings("unchecked")
+    var castedFuture = (CompletableFuture<V>) future;
+    return castedFuture;
+  }
+
+  @Override
+  default CompletableFuture<Map<K, V>> refreshAll(Iterable<? extends K> keys) {
+    var result = new LinkedHashMap<K, CompletableFuture<V>>(calculateHashMapCapacity(keys));
+    for (K key : keys) {
+      result.computeIfAbsent(key, this::refresh);
+    }
+    return composeResult(result);
+  }
+
+  /** Returns a mapping function that adapts to {@link CacheLoader#load}. */
+  static <K, V> Function<K, @Nullable V> newMappingFunction(CacheLoader<? super K, V> cacheLoader) {
+    return key -> {
+      try {
+        return cacheLoader.load(key);
+      } catch (RuntimeException e) {
+        throw e;
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new CompletionException(e);
+      } catch (Exception e) {
+        throw new CompletionException(e);
+      }
+    };
+  }
+
+  /** Returns a mapping function that adapts to {@link CacheLoader#loadAll}, if implemented. */
+  static <K, V> @Nullable Function<Set<? extends K>, Map<K, V>> newBulkMappingFunction(
+      CacheLoader<? super K, V> cacheLoader) {
+    if (!hasLoadAll(cacheLoader)) {
+      return null;
+    }
+    return keysToLoad -> {
+      try {
+        @SuppressWarnings("unchecked")
+        var loaded = (Map<K, V>) cacheLoader.loadAll(keysToLoad);
+        return loaded;
+      } catch (RuntimeException e) {
+        throw e;
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new CompletionException(e);
+      } catch (Exception e) {
+        throw new CompletionException(e);
+      }
+    };
+  }
+
+  /** Returns whether the supplied cache loader has bulk load functionality. */
+  static boolean hasLoadAll(CacheLoader<?, ?> loader) {
+    try {
+      Method classLoadAll = loader.getClass().getMethod("loadAll", Set.class);
+      Method defaultLoadAll = CacheLoader.class.getMethod("loadAll", Set.class);
+      return !classLoadAll.equals(defaultLoadAll);
+    } catch (NoSuchMethodException | SecurityException e) {
+      logger.log(Level.WARNING, "Cannot determine if CacheLoader can bulk load", e);
+      return false;
+    }
   }
 }

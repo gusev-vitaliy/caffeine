@@ -15,13 +15,12 @@
  */
 package com.github.benmanes.caffeine.cache;
 
+import static com.github.benmanes.caffeine.cache.Caffeine.requireArgument;
 import static java.util.Objects.requireNonNull;
 
 import java.io.Serializable;
 
-import javax.annotation.Nonnegative;
-import javax.annotation.Nonnull;
-import javax.annotation.concurrent.ThreadSafe;
+import org.jspecify.annotations.NullMarked;
 
 /**
  * Calculates the weights of cache entries. The total weight threshold is used to determine when an
@@ -31,7 +30,7 @@ import javax.annotation.concurrent.ThreadSafe;
  * @param <V> the type of values
  * @author ben.manes@gmail.com (Ben Manes)
  */
-@ThreadSafe
+@NullMarked
 @FunctionalInterface
 public interface Weigher<K, V> {
 
@@ -43,8 +42,7 @@ public interface Weigher<K, V> {
    * @param value the value to weigh
    * @return the weight of the entry; must be non-negative
    */
-  @Nonnegative
-  int weigh(@Nonnull K key, @Nonnull V value);
+  int weigh(K key, V value);
 
   /**
    * Returns a weigher where an entry has a weight of {@code 1}.
@@ -53,23 +51,21 @@ public interface Weigher<K, V> {
    * @param <V> the type of values
    * @return a weigher where an entry has a weight of {@code 1}
    */
-  @Nonnull
   static <K, V> Weigher<K, V> singletonWeigher() {
     @SuppressWarnings("unchecked")
-    Weigher<K, V> self = (Weigher<K, V>) SingletonWeigher.INSTANCE;
-    return self;
+    var instance = (Weigher<K, V>) SingletonWeigher.INSTANCE;
+    return instance;
   }
 
   /**
    * Returns a weigher that enforces that the weight is non-negative.
    *
-   * @param delegate the weigher to that weighs the entry
+   * @param delegate the weigher to weighs the entry
    * @param <K> the type of keys
    * @param <V> the type of values
    * @return a weigher that enforces that the weight is non-negative
    */
-  @Nonnull
-  static <K, V> Weigher<K, V> boundedWeigher(@Nonnull Weigher<K, V> delegate) {
+  static <K, V> Weigher<K, V> boundedWeigher(Weigher<K, V> delegate) {
     return new BoundedWeigher<>(delegate);
   }
 }
@@ -83,18 +79,19 @@ enum SingletonWeigher implements Weigher<Object, Object> {
 }
 
 final class BoundedWeigher<K, V> implements Weigher<K, V>, Serializable {
-  static final long serialVersionUID = 1;
+  private static final long serialVersionUID = 1;
+
+  @SuppressWarnings("serial")
   final Weigher<? super K, ? super V> delegate;
 
   BoundedWeigher(Weigher<? super K, ? super V> delegate) {
-    requireNonNull(delegate);
-    this.delegate = delegate;
+    this.delegate = requireNonNull(delegate);
   }
 
   @Override
   public int weigh(K key, V value) {
     int weight = delegate.weigh(key, value);
-    Caffeine.requireArgument(weight >= 0);
+    requireArgument(weight >= 0);
     return weight;
   }
 

@@ -30,17 +30,15 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
-import java.util.Arrays;
-import java.util.Calendar;
-import java.util.Collections;
 import java.util.Date;
-import java.util.HashMap;
-import java.util.HashSet;
+import java.util.GregorianCalendar;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.regex.Pattern;
+
+import org.jspecify.annotations.NullMarked;
 
 /**
  * A skeleton implementation where subclasses provide the serialization strategy. Serialization is
@@ -49,42 +47,36 @@ import java.util.regex.Pattern;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@NullMarked
+@SuppressWarnings({"ImmutableMemberCollection", "JavaUtilDate", "JdkObsolete"})
 public abstract class AbstractCopier<A> implements Copier {
-  private static final Map<Class<?>, Function<Object, Object>> JAVA_DEEP_COPY;
-  private static final Set<Class<?>> JAVA_IMMUTABLE;
-
-  static {
-    JAVA_IMMUTABLE = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(Boolean.class,
-        Byte.class, Character.class, Double.class, Float.class, Short.class, Integer.class,
-        Long.class, BigInteger.class, BigDecimal.class, String.class, Class.class, UUID.class,
-        URL.class, URI.class, Pattern.class, Inet4Address.class, Inet6Address.class,
-        InetSocketAddress.class, LocalDate.class, LocalTime.class, LocalDateTime.class,
-        Instant.class, Duration.class)));
-    Map<Class<?>, Function<Object, Object>> strategies = new HashMap<>();
-    strategies.put(Calendar.class, o -> ((Calendar) o).clone());
-    strategies.put(Date.class, o -> ((Date) o).clone());
-    JAVA_DEEP_COPY = Collections.unmodifiableMap(strategies);
-  }
+  private static final Map<Class<?>, Function<Object, Object>> JAVA_DEEP_COPY = Map.of(Date.class,
+      o -> ((Date) o).clone(), GregorianCalendar.class, o -> ((GregorianCalendar) o).clone());
+  private static final Set<Class<?>> JAVA_IMMUTABLE = Set.of(Boolean.class, Byte.class,
+      Character.class, Double.class, Float.class, Short.class, Integer.class, Long.class,
+      BigInteger.class, BigDecimal.class, String.class, Class.class, UUID.class, URL.class,
+      URI.class, Pattern.class, Inet4Address.class, Inet6Address.class, InetSocketAddress.class,
+      LocalDate.class, LocalTime.class, LocalDateTime.class, Instant.class, Duration.class);
 
   private final Set<Class<?>> immutableClasses;
   private final Map<Class<?>, Function<Object, Object>> deepCopyStrategies;
 
-  public AbstractCopier() {
+  protected AbstractCopier() {
     this(javaImmutableClasses(), javaDeepCopyStrategies());
   }
 
-  public AbstractCopier(Set<Class<?>> immutableClasses,
+  protected AbstractCopier(Set<Class<?>> immutableClasses,
       Map<Class<?>, Function<Object, Object>> deepCopyStrategies) {
     this.immutableClasses = requireNonNull(immutableClasses);
     this.deepCopyStrategies = requireNonNull(deepCopyStrategies);
   }
 
-  /** @return the set of Java native classes that are immutable */
+  /** Returns the set of Java native classes that are immutable. */
   public static Set<Class<?>> javaImmutableClasses() {
     return JAVA_IMMUTABLE;
   }
 
-  /** @return the set of Java native classes that are immutable. */
+  /** Returns the set of Java native classes that are deeply copied. */
   public static Map<Class<?>, Function<Object, Object>> javaDeepCopyStrategies() {
     return JAVA_DEEP_COPY;
   }
@@ -93,13 +85,20 @@ public abstract class AbstractCopier<A> implements Copier {
   public <T> T copy(T object, ClassLoader classLoader) {
     requireNonNull(object);
     requireNonNull(classLoader);
+
     if (isImmutable(object.getClass())) {
       return object;
-    } else if (canDeeplyCopy(object.getClass())) {
-      return deepCopy(object);
     } else if (isArrayOfImmutableTypes(object.getClass())) {
       return arrayCopy(object);
     }
+
+    var deeplyCopyStrategy = deepCopyStrategies.get(object.getClass());
+    if (deeplyCopyStrategy != null) {
+      @SuppressWarnings("unchecked")
+      var copy = (T) deeplyCopyStrategy.apply(object);
+      return copy;
+    }
+
     return roundtrip(object, classLoader);
   }
 
@@ -133,18 +132,12 @@ public abstract class AbstractCopier<A> implements Copier {
   }
 
   /** @return a shallow copy of the array. */
-  private <T> T arrayCopy(T object) {
+  @SuppressWarnings("SuspiciousSystemArraycopy")
+  private static <T> T arrayCopy(T object) {
     int length = Array.getLength(object);
     @SuppressWarnings("unchecked")
-    T copy = (T) Array.newInstance(object.getClass().getComponentType(), length);
+    var copy = (T) Array.newInstance(object.getClass().getComponentType(), length);
     System.arraycopy(object, 0, copy, 0, length);
-    return copy;
-  }
-
-  /** @return a deep copy of the object. */
-  private <T> T deepCopy(T object) {
-    @SuppressWarnings("unchecked")
-    T copy = (T) deepCopyStrategies.get(object.getClass()).apply(object);
     return copy;
   }
 
@@ -159,7 +152,7 @@ public abstract class AbstractCopier<A> implements Copier {
   protected <T> T roundtrip(T object, ClassLoader classLoader) {
     A data = serialize(object);
     @SuppressWarnings("unchecked")
-    T copy = (T) deserialize(data, classLoader);
+    var copy = (T) deserialize(data, classLoader);
     return copy;
   }
 

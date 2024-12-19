@@ -17,13 +17,13 @@ package com.github.benmanes.caffeine.cache.simulator.policy.two_queue;
 
 import static com.google.common.base.Preconditions.checkState;
 
-import java.util.Set;
+import org.jspecify.annotations.Nullable;
 
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
-import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
 import com.google.common.base.MoreObjects;
-import com.google.common.collect.ImmutableSet;
 import com.typesafe.config.Config;
 
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
@@ -44,7 +44,7 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  * hand, we have a cache hit on a cold buffer, it turns into a warm buffer and goes to the front of
  * the warm queue. Then as the warm queue lengthens, buffers start slipping from the end onto the
  * cold queue. Both the hot and warm queues are capped at one third of memory each to ensure
- * balance."
+ * balance.
  * <p>
  * Scan resistance is achieved by means of the warm queue. Transient data will pass from hot queue
  * to cold queue and be recycled. Responsiveness is maintained by making the warm queue LRU so that
@@ -52,7 +52,8 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public class TuQueuePolicy implements Policy {
+@PolicySpec(name = "two-queue.TuQueue")
+public class TuQueuePolicy implements KeyOnlyPolicy {
   private final Long2ObjectMap<Node> data;
   private final PolicyStats policyStats;
   private final int maximumSize;
@@ -68,22 +69,18 @@ public class TuQueuePolicy implements Policy {
   private int sizeCold;
   private final Node headCold;
 
+  @SuppressWarnings("this-escape")
   public TuQueuePolicy(Config config) {
-    TuQueueSettings settings = new TuQueueSettings(config);
+    var settings = new TuQueueSettings(config);
 
     this.headHot = new Node();
     this.headWarm = new Node();
     this.headCold = new Node();
-    this.maximumSize = settings.maximumSize();
     this.data = new Long2ObjectOpenHashMap<>();
-    this.policyStats = new PolicyStats("two-queue.TuQueue");
+    this.policyStats = new PolicyStats(name());
+    this.maximumSize = Math.toIntExact(settings.maximumSize());
     this.maxHot = (int) (maximumSize * settings.percentHot());
     this.maxWarm = (int) (maximumSize * settings.percentWarm());
-  }
-
-  /** Returns all variations of this policy based on the configuration parameters. */
-  public static Set<Policy> policies(Config config) {
-    return ImmutableSet.of(new TuQueuePolicy(config));
   }
 
   @Override
@@ -130,7 +127,7 @@ public class TuQueuePolicy implements Policy {
 
   /** Adds the entry to the cache as HOT, overflowing to the COLD queue, and evicts if necessary. */
   private void onMiss(long key) {
-    Node node = new Node(key);
+    var node = new Node(key);
     node.type = QueueType.HOT;
     node.appendToTail(headHot);
     data.put(key, node);
@@ -171,15 +168,15 @@ public class TuQueuePolicy implements Policy {
   enum QueueType {
     HOT,
     WARM,
-    COLD;
+    COLD,
   }
 
   static final class Node {
     final long key;
 
-    Node prev;
-    Node next;
-    QueueType type;
+    @Nullable Node prev;
+    @Nullable Node next;
+    @Nullable QueueType type;
 
     Node() {
       this.key = Long.MIN_VALUE;
@@ -215,8 +212,6 @@ public class TuQueuePolicy implements Policy {
 
     /** Removes the node from the list. */
     public void remove() {
-      checkState(key != Long.MIN_VALUE);
-
       prev.next = next;
       next.prev = prev;
       prev = next = null;

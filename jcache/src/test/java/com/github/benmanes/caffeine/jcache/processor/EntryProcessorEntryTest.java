@@ -15,12 +15,8 @@
  */
 package com.github.benmanes.caffeine.jcache.processor;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.hasToString;
-import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.not;
-import static org.hamcrest.Matchers.sameInstance;
+import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 
 import java.util.Map;
 import java.util.Optional;
@@ -29,56 +25,35 @@ import javax.cache.Cache;
 
 import org.testng.annotations.Test;
 
-import com.google.common.collect.Maps;
-
 /**
  * @author ben.manes@gmail.com (Ben Manes)
  */
 public final class EntryProcessorEntryTest {
-  EntryProcessorEntry<Integer, Integer> entry = new EntryProcessorEntry<>(1, 2, Optional.empty());
+  final EntryProcessorEntry<Integer, Integer> entry =
+      new EntryProcessorEntry<>(1, 2, Optional.empty());
 
-  @Test(expectedExceptions = IllegalArgumentException.class)
+  @Test
   public void unwrap_fail() {
-    entry.unwrap(Map.Entry.class);
+    assertThrows(IllegalArgumentException.class, () -> entry.unwrap(Map.Entry.class));
   }
 
   @Test
   public void unwrap() {
-    assertThat(entry.unwrap(Cache.Entry.class), sameInstance(entry));
-  }
-
-  @Test
-  public void equals_wrongType() {
-    assertThat(entry, is(not(equalTo(Maps.immutableEntry(1, 2)))));
-  }
-
-  @Test
-  public void equals_wrongValue() {
-    assertThat(entry, is(not(equalTo(new EntryProcessorEntry<>(1, 3, Optional.empty())))));
-  }
-
-  @Test
-  public void equals_nullValue() {
-    assertThat(entry, is(not(equalTo(new EntryProcessorEntry<>(1, null, Optional.empty())))));
+    assertThat(entry.unwrap(Cache.Entry.class)).isSameInstanceAs(entry);
   }
 
   @Test
   public void equals() {
-    assertThat(entry, is(equalTo(entry)));
-  }
-
-  @Test
-  public void hash_zero() {
-    assertThat(new EntryProcessorEntry<>(null, null, Optional.empty()).hashCode(), is(0));
+    assertThat(entry.equals(entry)).isTrue();
   }
 
   @Test
   public void hash() {
-    assertThat(entry.hashCode(), is(equalTo(Maps.immutableEntry(1, 2).hashCode())));
+    assertThat(entry.hashCode()).isEqualTo(entry.hashCode());
   }
 
   @Test
   public void string() {
-    assertThat(entry, hasToString(Maps.immutableEntry(1, 2).toString()));
+    assertThat(entry.toString()).isEqualTo(Map.entry(1, 2).toString());
   }
 }

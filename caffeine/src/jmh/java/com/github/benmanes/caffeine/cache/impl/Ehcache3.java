@@ -16,11 +16,8 @@
 package com.github.benmanes.caffeine.cache.impl;
 
 import org.ehcache.Cache;
-import org.ehcache.CacheManager;
-import org.ehcache.CacheManagerBuilder;
-import org.ehcache.config.CacheConfigurationBuilder;
-import org.ehcache.config.Eviction.Prioritizer;
-import org.ehcache.config.ResourcePoolsBuilder;
+import org.ehcache.config.builders.ResourcePoolsBuilder;
+import org.ehcache.config.builders.UserManagedCacheBuilder;
 import org.ehcache.config.units.EntryUnit;
 
 import com.github.benmanes.caffeine.cache.BasicCache;
@@ -31,16 +28,14 @@ import com.github.benmanes.caffeine.cache.BasicCache;
 public final class Ehcache3<K, V> implements BasicCache<K, V> {
   private final Cache<K, V> cache;
 
-  @SuppressWarnings("unchecked")
-  public Ehcache3(Prioritizer evictionPolicy, int maximumSize) {
-    CacheManager cacheManager = CacheManagerBuilder.newCacheManagerBuilder().build(true);
-    cache = (Cache<K, V>) cacheManager.createCache("benchmark",
-        CacheConfigurationBuilder.newCacheConfigurationBuilder()
-            .withResourcePools(ResourcePoolsBuilder.newResourcePoolsBuilder()
-                .heap(maximumSize, EntryUnit.ENTRIES)
-                .build())
-            .usingEvictionPrioritizer(evictionPolicy)
-            .buildConfig(Object.class, Object.class));
+  @SuppressWarnings({"PMD.CloseResource", "unchecked"})
+  public Ehcache3(int maximumSize) {
+    var resourcesPools = ResourcePoolsBuilder.newResourcePoolsBuilder()
+        .heap(maximumSize, EntryUnit.ENTRIES);
+    cache = (Cache<K, V>) UserManagedCacheBuilder
+        .newUserManagedCacheBuilder(Object.class, Object.class)
+        .withResourcePools(resourcesPools)
+        .build(true);
   }
 
   @Override
@@ -51,5 +46,15 @@ public final class Ehcache3<K, V> implements BasicCache<K, V> {
   @Override
   public void put(K key, V value) {
     cache.put(key, value);
+  }
+
+  @Override
+  public void remove(K key) {
+    cache.remove(key);
+  }
+
+  @Override
+  public void clear() {
+    cache.clear();
   }
 }

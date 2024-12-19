@@ -15,13 +15,14 @@
  */
 package com.github.benmanes.caffeine.cache;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
 
-import javax.lang.model.element.Modifier;
+import org.jspecify.annotations.Nullable;
 
-import com.google.common.base.CaseFormat;
 import com.squareup.javapoet.ClassName;
-import com.squareup.javapoet.FieldSpec;
 import com.squareup.javapoet.ParameterSpec;
 import com.squareup.javapoet.ParameterizedTypeName;
 import com.squareup.javapoet.TypeName;
@@ -46,8 +47,10 @@ public final class Specifications {
   public static final TypeName vRefQueueType = ParameterizedTypeName.get(
       ClassName.get(ReferenceQueue.class), vTypeVar);
   public static final ClassName nodeType = ClassName.get(PACKAGE_NAME, "Node");
-  public static final TypeName lookupKeyType = ParameterizedTypeName.get(ClassName.get(
-      PACKAGE_NAME + ".References", "LookupKeyReference"), kTypeVar);
+  public static final TypeName lookupKeyType =
+      ClassName.get(PACKAGE_NAME + ".References", "LookupKeyReference");
+  public static final TypeName referenceType = ParameterizedTypeName.get(
+      ClassName.get(Reference.class), kTypeVar);
   public static final TypeName referenceKeyType = ParameterizedTypeName.get(
       ClassName.get(PACKAGE_NAME + ".References", "WeakKeyReference"), kTypeVar);
   public static final TypeName rawReferenceKeyType = ParameterizedTypeName.get(
@@ -63,62 +66,46 @@ public final class Specifications {
   public static final ParameterSpec valueRefQueueSpec =
       ParameterSpec.builder(vRefQueueType, "valueReferenceQueue").build();
 
-  public static final ParameterSpec weightSpec = ParameterSpec.builder(int.class, "weight").build();
-  public static final TypeName NODE = ParameterizedTypeName.get(nodeType, kTypeVar, vTypeVar);
-  public static final TypeName UNSAFE_ACCESS =
-      ClassName.get("com.github.benmanes.caffeine.base", "UnsafeAccess");
+  public static final TypeName METHOD_HANDLES = ClassName.get(MethodHandles.class);
+  public static final TypeName LOOKUP = ClassName.get(MethodHandles.Lookup.class);
+  public static final TypeName VAR_HANDLE = ClassName.get(VarHandle.class);
 
-  public static final TypeName BUILDER = ParameterizedTypeName.get(
-      ClassName.get(PACKAGE_NAME, "Caffeine"), kTypeVar, vTypeVar);
-  public static final ParameterSpec BUILDER_PARAM =
-      ParameterSpec.builder(BUILDER, "builder").build();
-  public static final TypeName BOUNDED_LOCAL_CACHE = ParameterizedTypeName.get(
+  public static final ClassName LOCAL_CACHE_FACTORY =
+      ClassName.get(PACKAGE_NAME, "LocalCacheFactory");
+  public static final ParameterizedTypeName NODE_FACTORY = ParameterizedTypeName.get(
+      ClassName.get(PACKAGE_NAME, "NodeFactory"), kTypeVar, vTypeVar);
+  public static final ClassName BUILDER = ClassName.get(PACKAGE_NAME, "Caffeine");
+  public static final ParameterSpec BUILDER_PARAM = ParameterSpec.builder(
+      ParameterizedTypeName.get(BUILDER, kTypeVar, vTypeVar), "builder").build();
+  public static final ParameterizedTypeName BOUNDED_LOCAL_CACHE = ParameterizedTypeName.get(
       ClassName.get(PACKAGE_NAME, "BoundedLocalCache"), kTypeVar, vTypeVar);
+  public static final TypeName NODE = ParameterizedTypeName.get(nodeType, kTypeVar, vTypeVar);
 
-  public static final TypeName CACHE_LOADER = ParameterizedTypeName.get(
-      ClassName.get(PACKAGE_NAME, "CacheLoader"), TypeVariableName.get("? super K"), vTypeVar);
-  public static final ParameterSpec CACHE_LOADER_PARAM =
-      ParameterSpec.builder(CACHE_LOADER, "cacheLoader").build();
+  public static final ParameterizedTypeName ASYNC_CACHE_LOADER = ParameterizedTypeName.get(
+      ClassName.get(PACKAGE_NAME, "AsyncCacheLoader"), TypeVariableName.get("? super K"), vTypeVar);
+  public static final ParameterSpec ASYNC_CACHE_LOADER_PARAM = ParameterSpec
+      .builder(ASYNC_CACHE_LOADER, "cacheLoader").addAnnotation(Nullable.class).build();
 
   public static final TypeName REMOVAL_LISTENER = ParameterizedTypeName.get(
       ClassName.get(PACKAGE_NAME, "RemovalListener"), kTypeVar, vTypeVar);
 
-  public static final TypeName STATS_COUNTER = ClassName.get(PACKAGE_NAME + ".stats", "StatsCounter");
-
+  public static final TypeName STATS_COUNTER =
+      ClassName.get(PACKAGE_NAME + ".stats", "StatsCounter");
   public static final TypeName TICKER = ClassName.get(PACKAGE_NAME, "Ticker");
+  public static final TypeName PACER = ClassName.get(PACKAGE_NAME, "Pacer");
 
-  public static final TypeName WEIGHER = ParameterizedTypeName.get(
-      ClassName.get(PACKAGE_NAME, "Weigher"),
-      TypeVariableName.get("? super K"),
-      TypeVariableName.get("? super V"));
+  public static final TypeName ACCESS_ORDER_DEQUE =
+      ParameterizedTypeName.get(ClassName.get(PACKAGE_NAME, "AccessOrderDeque"), NODE);
+  public static final TypeName WRITE_ORDER_DEQUE =
+      ParameterizedTypeName.get(ClassName.get(PACKAGE_NAME, "WriteOrderDeque"), NODE);
 
-  public static final TypeName ACCESS_ORDER_DEQUE = ParameterizedTypeName.get(
-      ClassName.get(PACKAGE_NAME, "AccessOrderDeque"), NODE);
-
-  public static final TypeName WRITE_ORDER_DEQUE = ParameterizedTypeName.get(
-      ClassName.get(PACKAGE_NAME, "WriteOrderDeque"), NODE);
-
-  public static final ClassName WRITE_QUEUE_TYPE =
-      ClassName.get("com.github.benmanes.caffeine", "SingleConsumerQueue");
-  public static final TypeName WRITE_QUEUE = ParameterizedTypeName.get(
-      WRITE_QUEUE_TYPE, ClassName.get(Runnable.class));
+  public static final TypeName EXPIRY = ParameterizedTypeName.get(
+      ClassName.get(PACKAGE_NAME, "Expiry"), kTypeVar, vTypeVar);
+  public static final TypeName TIMER_WHEEL = ParameterizedTypeName.get(
+      ClassName.get(PACKAGE_NAME, "TimerWheel"), kTypeVar, vTypeVar);
 
   public static final TypeName FREQUENCY_SKETCH = ParameterizedTypeName.get(
-      ClassName.get("com.github.benmanes.caffeine.cache", "FrequencySketch"), kTypeVar);
+      ClassName.get(PACKAGE_NAME, "FrequencySketch"), kTypeVar);
 
   private Specifications() {}
-
-  /** Returns the offset constant to this variable. */
-  public static String offsetName(String varName) {
-    return CaseFormat.LOWER_CAMEL.to(CaseFormat.UPPER_UNDERSCORE, varName) + "_OFFSET";
-  }
-
-  /** Creates a public static field with an Unsafe address offset. */
-  public static FieldSpec newFieldOffset(String className, String varName) {
-    String name = offsetName(varName);
-    return FieldSpec
-        .builder(long.class, name, Modifier.PROTECTED, Modifier.STATIC, Modifier.FINAL)
-        .initializer("$T.objectFieldOffset($T.class, $S)", UNSAFE_ACCESS,
-            ClassName.bestGuess(className), varName).build();
-  }
 }

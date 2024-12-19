@@ -15,16 +15,20 @@
  */
 package com.github.benmanes.caffeine.cache.testing;
 
-import java.util.concurrent.TimeUnit;
+import java.io.Serializable;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.Reset;
+import com.github.benmanes.caffeine.cache.Ticker;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec.CacheExecutor;
+import com.github.benmanes.caffeine.cache.testing.CacheSpec.CacheExpiry;
+import com.github.benmanes.caffeine.cache.testing.CacheSpec.CacheScheduler;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec.CacheWeigher;
-import com.github.benmanes.caffeine.cache.testing.CacheSpec.Expire;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec.InitialCapacity;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec.Listener;
-import com.github.benmanes.caffeine.cache.testing.CacheSpec.MaximumSize;
+import com.github.benmanes.caffeine.cache.testing.CacheSpec.Loader;
+import com.github.benmanes.caffeine.cache.testing.CacheSpec.Maximum;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec.ReferenceType;
 
 /**
@@ -33,38 +37,45 @@ import com.github.benmanes.caffeine.cache.testing.CacheSpec.ReferenceType;
  * @author ben.manes@gmail.com (Ben Manes)
  */
 public final class CaffeineCacheFromContext {
+  interface SerializableTicker extends Ticker, Serializable {}
 
   private CaffeineCacheFromContext() {}
 
   public static <K, V> Cache<K, V> newCaffeineCache(CacheContext context) {
-    Caffeine<Object, Object> builder = Caffeine.newBuilder();
-    if (context.initialCapacity != InitialCapacity.DEFAULT) {
-      builder.initialCapacity(context.initialCapacity.size());
+    var builder = Caffeine.newBuilder();
+    context.caffeine = builder;
+
+    if (context.initialCapacity() != InitialCapacity.DEFAULT) {
+      builder.initialCapacity(context.initialCapacity().size());
     }
     if (context.isRecordingStats()) {
       builder.recordStats();
     }
-    if (context.maximumSize != MaximumSize.DISABLED) {
-      if (context.weigher == CacheWeigher.DEFAULT) {
-        builder.maximumSize(context.maximumSize.max());
+    if (context.maximum() != Maximum.DISABLED) {
+      if (context.cacheWeigher() == CacheWeigher.DISABLED) {
+        builder.maximumSize(context.maximum().max());
       } else {
-        builder.weigher(context.weigher);
+        builder.weigher(context.weigher());
         builder.maximumWeight(context.maximumWeight());
       }
     }
-    if (context.afterAccess != Expire.DISABLED) {
-      builder.expireAfterAccess(context.afterAccess.timeNanos(), TimeUnit.NANOSECONDS);
+    if (context.expiryType() != CacheExpiry.DISABLED) {
+      builder.expireAfter(context.expiry());
     }
-    if (context.afterWrite != Expire.DISABLED) {
-      builder.expireAfterWrite(context.afterWrite.timeNanos(), TimeUnit.NANOSECONDS);
+    if (context.expiresAfterAccess()) {
+      builder.expireAfterAccess(context.expireAfterAccess().duration());
     }
-    if (context.refresh != Expire.DISABLED) {
-      builder.refreshAfterWrite(context.refresh.timeNanos(), TimeUnit.NANOSECONDS);
+    if (context.expiresAfterWrite()) {
+      builder.expireAfterWrite(context.expireAfterWrite().duration());
+    }
+    if (context.refreshes()) {
+      builder.refreshAfterWrite(context.refreshAfterWrite().duration());
     }
     if (context.expires() || context.refreshes()) {
-      builder.ticker(context.ticker());
+      SerializableTicker ticker = context.ticker()::read;
+      builder.ticker(ticker);
     }
-    if (context.keyStrength == ReferenceType.WEAK) {
+    if (context.isWeakKeys()) {
       builder.weakKeys();
     } else if (context.keyStrength == ReferenceType.SOFT) {
       throw new IllegalStateException();
@@ -74,26 +85,35 @@ public final class CaffeineCacheFromContext {
     } else if (context.isSoftValues()) {
       builder.softValues();
     }
-    if (context.cacheExecutor != CacheExecutor.DEFAULT) {
-      builder.executor(context.executor);
+    if (context.executorType() != CacheExecutor.DEFAULT) {
+      builder.executor(context.executor());
     }
-    if (context.removalListenerType != Listener.DEFAULT) {
-      builder.removalListener(context.removalListener);
+    if (context.cacheScheduler != CacheScheduler.DISABLED) {
+      builder.scheduler(context.scheduler());
     }
-    if (context.isStrongKeys() && !context.isAsync()) {
-      builder.writer(context.cacheWriter());
+    if (context.removalListenerType() != Listener.DISABLED) {
+      builder.removalListener(context.removalListener());
+    }
+    if (context.evictionListenerType() != Listener.DISABLED) {
+      builder.evictionListener(context.evictionListener());
     }
     if (context.isAsync()) {
-      context.asyncCache = builder.buildAsync(context.loader);
+      if (context.loader() == Loader.DISABLED) {
+        context.asyncCache = builder.buildAsync();
+      } else {
+        context.asyncCache = builder.buildAsync(
+            context.isAsyncLoader() ? context.loader().async() : context.loader());
+      }
       context.cache = context.asyncCache.synchronous();
-    } else if (context.loader == null) {
+    } else if (context.loader() == Loader.DISABLED) {
       context.cache = builder.build();
     } else {
-      context.cache = builder.build(context.loader);
+      context.cache = builder.build(context.loader());
     }
 
     @SuppressWarnings("unchecked")
-    Cache<K, V> castedCache = (Cache<K, V>) context.cache;
+    var castedCache = (Cache<K, V>) context.cache;
+    Reset.resetThreadLocalRandom();
     return castedCache;
   }
 }

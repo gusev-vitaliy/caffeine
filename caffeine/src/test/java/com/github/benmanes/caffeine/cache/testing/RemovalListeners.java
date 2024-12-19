@@ -15,10 +15,14 @@
  */
 package com.github.benmanes.caffeine.cache.testing;
 
+import static java.util.Objects.requireNonNull;
+
 import java.io.Serializable;
-import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.RejectedExecutionException;
+
+import org.jspecify.annotations.Nullable;
 
 import com.github.benmanes.caffeine.cache.RemovalCause;
 import com.github.benmanes.caffeine.cache.RemovalListener;
@@ -33,13 +37,21 @@ public final class RemovalListeners {
   private RemovalListeners() {}
 
   /** A removal listener that stores the notifications for inspection. */
-  public static <K, V> RemovalListener<K, V> consuming() {
-    return new ConsumingRemovalListener<K, V>();
+  public static <K, V> ConsumingRemovalListener<K, V> consuming() {
+    return new ConsumingRemovalListener<>();
   }
 
   /** A removal listener that throws an exception if a notification arrives. */
   public static <K, V> RemovalListener<K, V> rejecting() {
-    return new RejectingRemovalListener<K, V>();
+    return new RejectingRemovalListener<>();
+  }
+
+  private static void validate(@Nullable Object key, @Nullable Object value, RemovalCause cause) {
+    if (cause != RemovalCause.COLLECTED) {
+      requireNonNull(key);
+      requireNonNull(value);
+    }
+    requireNonNull(cause);
   }
 
   public static final class RejectingRemovalListener<K, V>
@@ -50,7 +62,9 @@ public final class RemovalListeners {
     public int rejected;
 
     @Override
-    public void onRemoval(K key, V value, RemovalCause cause) {
+    public void onRemoval(@Nullable K key, @Nullable V value, RemovalCause cause) {
+      validate(key, value, cause);
+
       if (reject) {
         rejected++;
         throw new RejectedExecutionException("Rejected eviction of " +
@@ -63,19 +77,21 @@ public final class RemovalListeners {
       implements RemovalListener<K, V>, Serializable {
     private static final long serialVersionUID = 1L;
 
-    private final List<RemovalNotification<K, V>> evicted;
+    @SuppressWarnings("PMD.LooseCoupling")
+    private final CopyOnWriteArrayList<RemovalNotification<K, V>> removed;
 
     public ConsumingRemovalListener() {
-      this.evicted = new ArrayList<>();
+      this.removed = new CopyOnWriteArrayList<>();
     }
 
     @Override
-    public synchronized void onRemoval(K key, V value, RemovalCause cause) {
-      evicted.add(new RemovalNotification<>(key, value, cause));
+    public void onRemoval(@Nullable K key, @Nullable V value, RemovalCause cause) {
+      validate(key, value, cause);
+      removed.add(new RemovalNotification<>(key, value, cause));
     }
 
-    public List<RemovalNotification<K, V>> evicted() {
-      return evicted;
+    public List<RemovalNotification<K, V>> removed() {
+      return removed;
     }
   }
 }

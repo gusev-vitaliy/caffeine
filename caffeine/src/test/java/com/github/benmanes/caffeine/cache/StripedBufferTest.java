@@ -15,14 +15,15 @@
  */
 package com.github.benmanes.caffeine.cache;
 
-import static java.util.Objects.requireNonNull;
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.lessThanOrEqualTo;
-import static org.hamcrest.Matchers.nullValue;
+import static com.github.benmanes.caffeine.cache.StripedBuffer.MAXIMUM_TABLE_SIZE;
+import static com.github.benmanes.caffeine.cache.StripedBuffer.NCPU;
+import static com.google.common.truth.Truth.assertThat;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.function.Consumer;
 
+import org.testng.Assert;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
@@ -32,76 +33,105 @@ import com.google.common.base.MoreObjects;
 /**
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@SuppressWarnings("ClassEscapesDefinedScope")
 public final class StripedBufferTest {
   static final Integer ELEMENT = 1;
 
   @Test(dataProvider = "buffers")
   public void init(FakeBuffer<Integer> buffer) {
-    assertThat(buffer.table, is(nullValue()));
+    assertThat(buffer.table).isNull();
 
-    buffer.offer(ELEMENT);
-    assertThat(buffer.table.length, is(1));
+    var result = buffer.offer(ELEMENT);
+    assertThat(buffer.table).hasLength(1);
+    assertThat(result).isEqualTo(Buffer.SUCCESS);
   }
 
-  @Test(dataProvider = "buffers")
-  public void produce(FakeBuffer<Integer> buffer) {
-    ConcurrentTestHarness.timeTasks(10, () -> {
-      for (int i = 0; i < 10; i++) {
-        buffer.offer(ELEMENT);
+  @Test
+  public void expand() {
+    var buffer = new FakeBuffer<Integer>(Buffer.FAILED);
+    assertThat(buffer.offer(ELEMENT)).isEqualTo(Buffer.SUCCESS);
+
+    for (int i = 0; i < 64; i++) {
+      int result = buffer.offer(ELEMENT);
+      if (result == Buffer.SUCCESS) {
+        return;
+      }
+    }
+    Assert.fail();
+  }
+
+  @Test
+  @SuppressWarnings("ThreadPriorityCheck")
+  public void expand_concurrent() {
+    var buffer = new FakeBuffer<Boolean>(Buffer.FAILED);
+    ConcurrentTestHarness.timeTasks(10 * NCPU, () -> {
+      for (int i = 0; i < 1000; i++) {
+        assertThat(buffer.offer(Boolean.TRUE)).isAnyOf(Buffer.SUCCESS, Buffer.FULL, Buffer.FAILED);
         Thread.yield();
       }
     });
-    assertThat(buffer.table.length, lessThanOrEqualTo(StripedBuffer.MAXIMUM_TABLE_SIZE));
+    assertThat(buffer.table).hasLength(MAXIMUM_TABLE_SIZE);
+  }
+
+  @Test(dataProvider = "buffers")
+  @SuppressWarnings("ThreadPriorityCheck")
+  public void produce(FakeBuffer<Integer> buffer) {
+    ConcurrentTestHarness.timeTasks(NCPU, () -> {
+      for (int i = 0; i < 10; i++) {
+        assertThat(buffer.offer(ELEMENT)).isAnyOf(Buffer.SUCCESS, Buffer.FULL, Buffer.FAILED);
+        Thread.yield();
+      }
+    });
+    assertThat(buffer.table).isNotNull();
+    assertThat(buffer.table.length).isAtMost(MAXIMUM_TABLE_SIZE);
   }
 
   @Test(dataProvider = "buffers")
   public void drain(FakeBuffer<Integer> buffer) {
     buffer.drainTo(e -> {});
-    assertThat(buffer.drains, is(0));
+    assertThat(buffer.drains).isEqualTo(0);
 
     // Expand and drain
-    buffer.offer(ELEMENT);
+    assertThat(buffer.offer(ELEMENT)).isEqualTo(Buffer.SUCCESS);
+
     buffer.drainTo(e -> {});
-    assertThat(buffer.drains, is(1));
+    assertThat(buffer.drains).isEqualTo(1);
   }
 
-  @DataProvider
-  public Object[][] buffers() {
-    return new Object[][] {
-        { new FakeBuffer<Integer>(Buffer.FULL) },
-        { new FakeBuffer<Integer>(Buffer.FAILED) },
-        { new FakeBuffer<Integer>(Buffer.SUCCESS) },
-    };
-  }
-
-  static int ceilingNextPowerOfTwo(int x) {
-    return 1 << (Integer.SIZE - Integer.numberOfLeadingZeros(x - 1));
+  @DataProvider(name = "buffers")
+  public Object[] providesBuffers() {
+    var results = List.of(Buffer.SUCCESS, Buffer.FAILED, Buffer.FULL);
+    var buffers = new ArrayList<Buffer<Integer>>();
+    for (var result : results) {
+      buffers.add(new FakeBuffer<>(result));
+    }
+    return buffers.toArray();
   }
 
   static final class FakeBuffer<E> extends StripedBuffer<E> {
     final int result;
-    int drains = 0;
+    int drains;
 
     FakeBuffer(int result) {
-      this.result = requireNonNull(result);
+      this.result = result;
     }
 
     @Override protected Buffer<E> create(E e) {
-      return new Buffer<E>() {
+      return new Buffer<>() {
         @Override public int offer(E e) {
           return result;
         }
         @Override public void drainTo(Consumer<E> consumer) {
           drains++;
         }
-        @Override public int size() {
-          return 0;
+        @Override public long size() {
+          return 0L;
         }
-        @Override public int reads() {
-          return 0;
+        @Override public long reads() {
+          return 0L;
         }
-        @Override public int writes() {
-          return 0;
+        @Override public long writes() {
+          return 0L;
         }
       };
     }

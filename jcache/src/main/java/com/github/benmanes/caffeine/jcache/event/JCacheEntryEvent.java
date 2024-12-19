@@ -24,22 +24,28 @@ import javax.cache.Cache;
 import javax.cache.event.CacheEntryEvent;
 import javax.cache.event.EventType;
 
+import org.jspecify.annotations.Nullable;
+
 /**
  * A cache event dispatched to a listener.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@SuppressWarnings("serial")
 final class JCacheEntryEvent<K, V> extends CacheEntryEvent<K, V>
     implements Iterable<CacheEntryEvent<? extends K, ? extends V>> {
   private static final long serialVersionUID = 1L;
 
   private final K key;
-  private final V oldValue;
-  private final V newValue;
+  private final boolean hasOldValue;
+  private final @Nullable V oldValue;
+  private final @Nullable V newValue;
 
-  JCacheEntryEvent(Cache<K, V> source, EventType eventType, K key, V oldValue, V newValue) {
+  JCacheEntryEvent(Cache<K, V> source, EventType eventType,
+      K key, boolean hasOldValue, @Nullable V oldValue, @Nullable V newValue) {
     super(source, eventType);
     this.key = requireNonNull(key);
+    this.hasOldValue = hasOldValue;
     this.oldValue = oldValue;
     this.newValue = newValue;
   }
@@ -50,18 +56,18 @@ final class JCacheEntryEvent<K, V> extends CacheEntryEvent<K, V>
   }
 
   @Override
-  public V getValue() {
+  public @Nullable V getValue() {
     return newValue;
   }
 
   @Override
-  public V getOldValue() {
+  public @Nullable V getOldValue() {
     return oldValue;
   }
 
   @Override
   public boolean isOldValueAvailable() {
-    return (oldValue != null);
+    return hasOldValue;
   }
 
   @Override
@@ -70,13 +76,13 @@ final class JCacheEntryEvent<K, V> extends CacheEntryEvent<K, V>
       throw new IllegalArgumentException("Class " + clazz + " is unknown to this implementation");
     }
     @SuppressWarnings("unchecked")
-    T castedEntry = (T) this;
+    var castedEntry = (T) this;
     return castedEntry;
   }
 
   @Override
   public Iterator<CacheEntryEvent<? extends K, ? extends V>> iterator() {
-    return new Iterator<CacheEntryEvent<? extends K, ? extends V>>() {
+    return new Iterator<>() {
       boolean hasNext = true;
 
       @Override

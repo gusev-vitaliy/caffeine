@@ -15,22 +15,57 @@
  */
 package com.github.benmanes.caffeine.cache.node;
 
+import static com.github.benmanes.caffeine.cache.Specifications.LOOKUP;
+import static com.github.benmanes.caffeine.cache.Specifications.METHOD_HANDLES;
+
+import org.apache.commons.lang3.StringUtils;
+
+import com.squareup.javapoet.AnnotationSpec;
+import com.squareup.javapoet.CodeBlock;
+
 /**
  * Finishes construction of the node.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public class Finalize extends NodeRule {
+public class Finalize implements NodeRule {
 
   @Override
-  protected boolean applies() {
+  public boolean applies(NodeContext context) {
     return true;
   }
 
   @Override
-  protected void execute() {
+  public void execute(NodeContext context) {
+    if (!context.suppressedWarnings.isEmpty()) {
+      var format = (context.suppressedWarnings.size() == 1)
+          ? "$S"
+          : "{" + StringUtils.repeat("$S", ", ", context.suppressedWarnings.size()) + "}";
+      context.nodeSubtype.addAnnotation(AnnotationSpec.builder(SuppressWarnings.class)
+          .addMember("value", format, context.suppressedWarnings.toArray())
+          .build());
+    }
     context.nodeSubtype
+        .addMethod(context.constructorDefault.build())
         .addMethod(context.constructorByKey.build())
         .addMethod(context.constructorByKeyRef.build());
+    addStaticBlock(context);
+  }
+
+  private static void addStaticBlock(NodeContext context) {
+    if (context.varHandles.isEmpty()) {
+      return;
+    }
+    var codeBlock = CodeBlock.builder()
+        .addStatement("$T lookup = $T.lookup()", LOOKUP, METHOD_HANDLES)
+        .beginControlFlow("try");
+    for (var varHandle : context.varHandles) {
+      varHandle.accept(codeBlock);
+    }
+    codeBlock
+        .nextControlFlow("catch ($T e)", ReflectiveOperationException.class)
+          .addStatement("throw new ExceptionInInitializerError(e)")
+        .endControlFlow();
+    context.nodeSubtype.addStaticBlock(codeBlock.build());
   }
 }

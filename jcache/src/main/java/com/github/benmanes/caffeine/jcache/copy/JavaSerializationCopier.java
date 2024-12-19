@@ -31,6 +31,8 @@ import java.util.function.Function;
 
 import javax.cache.CacheException;
 
+import org.jspecify.annotations.NullMarked;
+
 /**
  * A strategy that uses Java serialization if a fast path approach is not applicable.
  * <p>
@@ -40,6 +42,7 @@ import javax.cache.CacheException;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@NullMarked
 public class JavaSerializationCopier extends AbstractCopier<byte[]> {
 
   public JavaSerializationCopier() {
@@ -53,25 +56,32 @@ public class JavaSerializationCopier extends AbstractCopier<byte[]> {
 
   @Override
   protected byte[] serialize(Object object) {
-    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-    try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
+    var bytes = new ByteArrayOutputStream();
+    try (var output = new ObjectOutputStream(bytes)) {
       output.writeObject(object);
     } catch (IOException e) {
-      throw new UncheckedIOException("Failed to serialize " + e.getClass(), e);
+      throw new UncheckedIOException("Failed to serialize " + object.getClass(), e);
     }
     return bytes.toByteArray();
   }
 
   @Override
+  @SuppressWarnings("BanSerializableRead")
   protected Object deserialize(byte[] data, ClassLoader classLoader) {
-    try (InputStream bytes = new ByteArrayInputStream(data);
-        ObjectInputStream input = new ClassLoaderAwareObjectInputStream(bytes, classLoader)) {
+    try (var bytes = new ByteArrayInputStream(data);
+         var input = newInputStream(bytes, classLoader)) {
       return input.readObject();
     } catch (IOException e) {
       throw new CacheException("Failed to deserialize", e);
     } catch (ClassNotFoundException e) {
       throw new CacheException("Failed to resolve a deserialized class", e);
     }
+  }
+
+  // @VisibleForTesting
+  ObjectInputStream newInputStream(
+      InputStream in, ClassLoader classLoader) throws IOException {
+    return new ClassLoaderAwareObjectInputStream(in, classLoader);
   }
 
   /** An {@linkplain ObjectInputStream} that instantiates using the supplied classloader. */
@@ -89,10 +99,11 @@ public class JavaSerializationCopier extends AbstractCopier<byte[]> {
     }
 
     @Override
+    @SuppressWarnings("BanSerializableRead")
     protected Class<?> resolveClass(ObjectStreamClass desc)
         throws IOException, ClassNotFoundException {
       try {
-        return Class.forName(desc.getName(), false, getClassLoader());
+        return Class.forName(desc.getName(), /* initialize= */ false, getClassLoader());
       } catch (ClassNotFoundException ex) {
         return super.resolveClass(desc);
       }

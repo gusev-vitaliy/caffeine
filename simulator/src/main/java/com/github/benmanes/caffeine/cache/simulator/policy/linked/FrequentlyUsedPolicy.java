@@ -15,19 +15,23 @@
  */
 package com.github.benmanes.caffeine.cache.simulator.policy.linked;
 
+import static java.util.Locale.US;
 import static java.util.Objects.requireNonNull;
-import static java.util.stream.Collectors.toSet;
+import static java.util.stream.Collectors.toUnmodifiableSet;
 
 import java.util.Set;
 
 import org.apache.commons.lang3.StringUtils;
+import org.jspecify.annotations.Nullable;
 
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
 import com.github.benmanes.caffeine.cache.simulator.admission.Admission;
 import com.github.benmanes.caffeine.cache.simulator.admission.Admittor;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
 import com.google.common.base.MoreObjects;
+import com.google.errorprone.annotations.Var;
 import com.typesafe.config.Config;
 
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
@@ -39,31 +43,30 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class FrequentlyUsedPolicy implements Policy {
-  private final PolicyStats policyStats;
-  private final Long2ObjectMap<Node> data;
-  private final EvictionPolicy policy;
-  private final FrequencyNode freq0;
-  private final Admittor admittor;
-  private final int maximumSize;
+public final class FrequentlyUsedPolicy implements KeyOnlyPolicy {
+  final PolicyStats policyStats;
+  final Long2ObjectMap<Node> data;
+  final EvictionPolicy policy;
+  final FrequencyNode freq0;
+  final Admittor admittor;
+  final int maximumSize;
 
   public FrequentlyUsedPolicy(Admission admission, EvictionPolicy policy, Config config) {
-    String name = admission.format("linked." + policy.label());
-    BasicSettings settings = new BasicSettings(config);
+    var settings = new BasicSettings(config);
+    this.policyStats = new PolicyStats(admission.format(policy.label()));
+    this.maximumSize = Math.toIntExact(settings.maximumSize());
+    this.admittor = admission.from(config, policyStats);
     this.data = new Long2ObjectOpenHashMap<>();
-    this.maximumSize = settings.maximumSize();
-    this.policyStats = new PolicyStats(name);
-    this.admittor = admission.from(config);
     this.policy = requireNonNull(policy);
-    this.freq0 = new FrequencyNode(0);
+    this.freq0 = new FrequencyNode();
   }
 
   /** Returns all variations of this policy based on the configuration parameters. */
   public static Set<Policy> policies(Config config, EvictionPolicy policy) {
-    BasicSettings settings = new BasicSettings(config);
+    var settings = new BasicSettings(config);
     return settings.admission().stream().map(admission ->
       new FrequentlyUsedPolicy(admission, policy, config)
-    ).collect(toSet());
+    ).collect(toUnmodifiableSet());
   }
 
   @Override
@@ -104,7 +107,7 @@ public final class FrequentlyUsedPolicy implements Policy {
     FrequencyNode freq1 = (freq0.next.count == 1)
         ? freq0.next
         : new FrequencyNode(1, freq0);
-    Node node = new Node(key, freq1);
+    var node = new Node(freq1, key);
     policyStats.recordMiss();
     data.put(key, node);
     node.append();
@@ -137,7 +140,7 @@ public final class FrequentlyUsedPolicy implements Policy {
     }
 
     // find the lowest that is not the candidate
-    Node victim = freq0.next.nextNode.next;
+    @Var Node victim = freq0.next.nextNode.next;
     if (victim == candidate) {
       victim = (victim.next == victim.prev)
           ? victim.freq.next.nextNode.next
@@ -159,23 +162,23 @@ public final class FrequentlyUsedPolicy implements Policy {
     LFU, MFU;
 
     public String label() {
-      return StringUtils.capitalize(name().toLowerCase());
+      return "linked." + StringUtils.capitalize(name().toLowerCase(US));
     }
   }
 
   /** A frequency count and associated chain of cache entries. */
   static final class FrequencyNode {
-    private final int count;
-    private final Node nextNode;
+    final int count;
+    final Node nextNode;
 
-    private FrequencyNode prev;
-    private FrequencyNode next;
+    @Nullable FrequencyNode prev;
+    @Nullable FrequencyNode next;
 
-    public FrequencyNode(int count) {
+    public FrequencyNode() {
       nextNode = new Node(this);
-      this.count = count;
       this.prev = this;
       this.next = this;
+      this.count = 0;
     }
 
     public FrequencyNode(int count, FrequencyNode prev) {
@@ -208,11 +211,11 @@ public final class FrequentlyUsedPolicy implements Policy {
 
   /** A cache entry on the frequency node's chain. */
   static final class Node {
-    private final long key;
+    final long key;
 
-    private FrequencyNode freq;
-    private Node prev;
-    private Node next;
+    FrequencyNode freq;
+    @Nullable Node prev;
+    @Nullable Node next;
 
     public Node(FrequencyNode freq) {
       this.key = Long.MIN_VALUE;
@@ -221,7 +224,7 @@ public final class FrequentlyUsedPolicy implements Policy {
       this.next = this;
     }
 
-    public Node(long key, FrequencyNode freq) {
+    public Node(FrequencyNode freq, long key) {
       this.next = null;
       this.prev = null;
       this.freq = freq;

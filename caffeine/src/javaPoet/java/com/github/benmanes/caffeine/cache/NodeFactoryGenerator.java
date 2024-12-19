@@ -15,356 +15,201 @@
  */
 package com.github.benmanes.caffeine.cache;
 
-import static com.github.benmanes.caffeine.cache.Specifications.DEAD_STRONG_KEY;
-import static com.github.benmanes.caffeine.cache.Specifications.DEAD_WEAK_KEY;
 import static com.github.benmanes.caffeine.cache.Specifications.PACKAGE_NAME;
-import static com.github.benmanes.caffeine.cache.Specifications.RETIRED_STRONG_KEY;
-import static com.github.benmanes.caffeine.cache.Specifications.RETIRED_WEAK_KEY;
-import static com.github.benmanes.caffeine.cache.Specifications.kRefQueueType;
 import static com.github.benmanes.caffeine.cache.Specifications.kTypeVar;
-import static com.github.benmanes.caffeine.cache.Specifications.keyRefQueueSpec;
-import static com.github.benmanes.caffeine.cache.Specifications.keyRefSpec;
-import static com.github.benmanes.caffeine.cache.Specifications.keySpec;
-import static com.github.benmanes.caffeine.cache.Specifications.lookupKeyType;
-import static com.github.benmanes.caffeine.cache.Specifications.rawReferenceKeyType;
-import static com.github.benmanes.caffeine.cache.Specifications.referenceKeyType;
 import static com.github.benmanes.caffeine.cache.Specifications.vTypeVar;
-import static com.github.benmanes.caffeine.cache.Specifications.valueRefQueueSpec;
-import static com.github.benmanes.caffeine.cache.Specifications.valueSpec;
+import static com.google.common.base.Preconditions.checkState;
+import static com.google.common.collect.ImmutableList.toImmutableList;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.Year;
+import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.NavigableMap;
 import java.util.Set;
 import java.util.TreeMap;
-
-import javax.lang.model.element.Modifier;
+import java.util.spi.ToolProvider;
+import java.util.stream.Stream;
 
 import com.github.benmanes.caffeine.cache.node.AddConstructors;
 import com.github.benmanes.caffeine.cache.node.AddDeques;
 import com.github.benmanes.caffeine.cache.node.AddExpiration;
+import com.github.benmanes.caffeine.cache.node.AddFactoryMethods;
 import com.github.benmanes.caffeine.cache.node.AddHealth;
 import com.github.benmanes.caffeine.cache.node.AddKey;
 import com.github.benmanes.caffeine.cache.node.AddMaximum;
 import com.github.benmanes.caffeine.cache.node.AddSubtype;
-import com.github.benmanes.caffeine.cache.node.AddToString;
 import com.github.benmanes.caffeine.cache.node.AddValue;
 import com.github.benmanes.caffeine.cache.node.Finalize;
 import com.github.benmanes.caffeine.cache.node.NodeContext;
 import com.github.benmanes.caffeine.cache.node.NodeRule;
-import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
-import com.squareup.javapoet.AnnotationSpec;
+import com.google.common.io.Resources;
 import com.squareup.javapoet.ClassName;
-import com.squareup.javapoet.FieldSpec;
 import com.squareup.javapoet.JavaFile;
-import com.squareup.javapoet.MethodSpec;
 import com.squareup.javapoet.ParameterizedTypeName;
 import com.squareup.javapoet.TypeName;
 import com.squareup.javapoet.TypeSpec;
 
 /**
- * Generates the cache entry factory and specialized types. These entries are optimized for the
- * configuration to minimize memory use. An entry may have any of the following properties:
+ * Generates the cache entry's specialized type. These entries are optimized for the configuration
+ * to minimize memory use. An entry may have any of the following properties:
  * <ul>
- *   <li>strong or weak keys
- *   <li>strong, weak, or soft values
+ *   <li>strong or weak key
+ *   <li>strong, weak, or soft value
  *   <li>access timestamp
  *   <li>write timestamp
+ *   <li>size queue type
+ *   <li>list references
  *   <li>weight
  * </ul>
- * <p>
- * If the cache has either a maximum size or expires after access, then the entry will also contain
- * prev/next references on a access ordered queue. If the cache expires after write, then the entry
- * will also contain prev/next on a write ordered queue.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
 public final class NodeFactoryGenerator {
-  final Path directory;
-  final NavigableMap<String, ImmutableSet<Feature>> classNameToFeatures;
-  final List<NodeRule> rules = ImmutableList.of(new AddSubtype(), new AddConstructors(),
+  private final List<NodeRule> rules = List.of(new AddSubtype(), new AddConstructors(),
       new AddKey(), new AddValue(), new AddMaximum(), new AddExpiration(), new AddDeques(),
-      new AddHealth(), new AddToString(), new Finalize());
+      new AddFactoryMethods(),  new AddHealth(), new Finalize());
+  private final Feature[] featureByIndex = { null, null, Feature.EXPIRE_ACCESS,
+      Feature.EXPIRE_WRITE, Feature.REFRESH_WRITE, Feature.MAXIMUM_SIZE, Feature.MAXIMUM_WEIGHT };
+  private final List<TypeSpec> nodeTypes;
+  private final Path directory;
 
-  TypeSpec.Builder nodeFactory;
-
-  public NodeFactoryGenerator(Path directory) {
+  private NodeFactoryGenerator(Path directory) {
     this.directory = requireNonNull(directory);
-    this.classNameToFeatures = new TreeMap<>();
+    this.nodeTypes = new ArrayList<>();
   }
 
-  void generate() throws IOException {
-    nodeFactory = TypeSpec.enumBuilder("NodeFactory")
-        .addAnnotation(AnnotationSpec.builder(SuppressWarnings.class)
-            .addMember("value", "{$S, $S, $S}", "unchecked", "GuardedByChecker", "PMD")
-            .build());
-    addClassJavaDoc();
-    addNodeStateStatics();
-    addKeyMethods();
+  private void generate() throws IOException {
     generatedNodes();
-    addGetFactoryMethods();
     writeJavaFile();
+    reformat();
   }
 
   private void writeJavaFile() throws IOException {
-    JavaFile.builder(getClass().getPackage().getName(), nodeFactory.build())
-        .addFileComment("Copyright $L Ben Manes. All Rights Reserved.", Year.now())
-        .indent("  ")
-        .build()
-        .writeTo(directory);
-  }
-
-  private void addClassJavaDoc() {
-    nodeFactory.addJavadoc("<em>WARNING: GENERATED CODE</em>\n\n")
-        .addJavadoc("A factory for cache nodes optimized for a particular configuration.\n")
-        .addJavadoc("\n@author ben.manes@gmail.com (Ben Manes)\n");
-  }
-
-  private void addNodeStateStatics() {
-    Modifier[] modifiers = { Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL };
-
-    nodeFactory.addField(FieldSpec.builder(Object.class, RETIRED_STRONG_KEY, modifiers)
-        .initializer("new Object()")
-        .build());
-    nodeFactory.addField(FieldSpec.builder(Object.class, DEAD_STRONG_KEY, modifiers)
-        .initializer("new Object()")
-        .build());
-
-    nodeFactory.addField(FieldSpec.builder(rawReferenceKeyType, RETIRED_WEAK_KEY, modifiers)
-        .initializer("new $T(null, null)", rawReferenceKeyType)
-        .build());
-    nodeFactory.addField(FieldSpec.builder(rawReferenceKeyType, DEAD_WEAK_KEY, modifiers)
-        .initializer("new $T(null, null)", rawReferenceKeyType)
-        .build());
-  }
-
-  private void addKeyMethods() {
-    nodeFactory.addMethod(newNodeByKeyAbstractMethod())
-        .addMethod(newNodeByKeyRefAbstractMethod())
-        .addMethod(newLookupKeyMethod())
-        .addMethod(newReferenceKeyMethod());
-  }
-
-  private MethodSpec newNodeByKeyAbstractMethod() {
-    return newNodeByKey().addModifiers(Modifier.ABSTRACT)
-        .addJavadoc("Returns a node optimized for the specified features.\n").build();
-  }
-
-  private MethodSpec newNodeByKeyRefAbstractMethod() {
-    return newNodeByKeyRef().addModifiers(Modifier.ABSTRACT)
-        .addJavadoc("Returns a node optimized for the specified features.\n").build();
-  }
-
-  private MethodSpec newLookupKeyMethod() {
-    return MethodSpec.methodBuilder("newLookupKey")
-        .addJavadoc("Returns a key suitable for looking up an entry in the cache. If the cache "
-            + "holds keys strongly\nthen the key is returned. If the cache holds keys weakly "
-            + "then a {@link $T}\nholding the key argument is returned.\n", lookupKeyType)
-        .addTypeVariable(kTypeVar)
-        .addParameter(kTypeVar, "key")
-        .addStatement("return key")
-        .returns(Object.class)
-        .build();
-  }
-
-  private MethodSpec newReferenceKeyMethod() {
-    return MethodSpec.methodBuilder("newReferenceKey")
-        .addJavadoc("Returns a key suitable for inserting into the cache. If the cache holds"
-            + " keys strongly then\nthe key is returned. If the cache holds keys weakly "
-            + "then a {@link $T}\nholding the key argument is returned.\n", referenceKeyType)
-        .addTypeVariable(kTypeVar)
-        .addParameter(kTypeVar, "key")
-        .addParameter(kRefQueueType, "referenceQueue")
-        .returns(Object.class)
-        .addStatement("return $L", "key")
-        .build();
-  }
-
-  private void addGetFactoryMethods() {
-    MethodSpec.Builder getFactory = MethodSpec.methodBuilder("getFactory")
-        .addJavadoc("Returns a factory optimized for the specified features.\n")
-        .returns(ClassName.bestGuess("NodeFactory"));
-
-    List<String> params = ImmutableList.of("strongKeys", "weakKeys", "strongValues", "weakValues",
-        "softValues", "expiresAfterAccess", "expiresAfterWrite", "refreshAfterWrite",
-        "maximumSize", "weighed");
-    for (String param : params) {
-      getFactory.addParameter(boolean.class, param);
+    String header = Resources.toString(Resources.getResource("license.txt"), UTF_8).trim();
+    var timeZone = ZoneId.of("America/Los_Angeles");
+    for (TypeSpec node : nodeTypes) {
+      JavaFile.builder(getClass().getPackage().getName(), node)
+          .addFileComment(header, Year.now(timeZone))
+          .skipJavaLangImports(true)
+          .indent("  ")
+          .build()
+          .writeTo(directory);
     }
-
-    nodeFactory.addMethod(MethodSpec.methodBuilder("weakValues")
-        .addJavadoc("Returns whether this factory supports the weak values.\n")
-        .addStatement("return name().matches($S)", ".W.*")
-        .returns(boolean.class)
-        .build());
-    nodeFactory.addMethod(MethodSpec.methodBuilder("softValues")
-        .addJavadoc("Returns whether this factory supports the soft values.\n")
-        .addStatement("return name().matches($S)", ".So.*")
-        .returns(boolean.class)
-        .build());
-
-    Preconditions.checkState(!classNameToFeatures.isEmpty(), "Must generate all cache types first");
-    getFactory
-        .addCode(NodeSelectorCode.get())
-        .addModifiers(Modifier.STATIC)
-        .build();
-    nodeFactory.addMethod(getFactory.build());
   }
 
-  private void generatedNodes() throws IOException {
-    fillClassNameToFeatures();
-    classNameToFeatures.entrySet().stream().forEach(entry -> {
-      String className = entry.getKey();
+  @SuppressWarnings("SystemOut")
+  private void reformat() throws IOException {
+    if (Boolean.parseBoolean(System.getenv("JDK_EA"))) {
+      return; // may be incompatible for EA builds
+    }
+    try (Stream<Path> stream = Files.walk(directory)) {
+      ImmutableList<String> files = stream
+          .map(Path::toString)
+          .filter(path -> path.endsWith(".java"))
+          .collect(toImmutableList());
+      ToolProvider.findFirst("google-java-format").ifPresent(formatter -> {
+        int result = formatter.run(System.out, System.err,
+            Stream.concat(Stream.of("-i"), files.stream()).toArray(String[]::new));
+        checkState(result == 0, "Java formatting failed with %s exit code", result);
+      });
+    }
+  }
+
+  private void generatedNodes() {
+    NavigableMap<String, ImmutableSet<Feature>> classNameToFeatures = getClassNameToFeatures();
+    classNameToFeatures.forEach((className, features) -> {
       String higherKey = classNameToFeatures.higherKey(className);
       boolean isLeaf = (higherKey == null) || !higherKey.startsWith(className);
-      addNodeSpec(entry.getKey(), isLeaf, entry.getValue());
+      TypeSpec nodeSpec = makeNodeSpec(className, isLeaf, features);
+      nodeTypes.add(nodeSpec);
     });
   }
 
-  private void fillClassNameToFeatures() {
-    Feature[] featureByIndex = new Feature[] { null, null,
-        Feature.EXPIRE_ACCESS, Feature.EXPIRE_WRITE, Feature.REFRESH_WRITE,
-        Feature.MAXIMUM_SIZE, Feature.MAXIMUM_WEIGHT };
-
+  private NavigableMap<String, ImmutableSet<Feature>> getClassNameToFeatures() {
+    var classNameToFeatures = new TreeMap<String, ImmutableSet<Feature>>();
     for (List<Object> combination : combinations()) {
-      Set<Feature> features = new LinkedHashSet<>();
-
-      features.add((Feature) combination.get(0));
-      features.add((Feature) combination.get(1));
-      for (int i = 2; i < combination.size(); i++) {
-        if ((Boolean) combination.get(i)) {
-          features.add(featureByIndex[i]);
-        }
-      }
-      if (features.contains(Feature.MAXIMUM_WEIGHT)) {
-        features.remove(Feature.MAXIMUM_SIZE);
-      }
-
-      String className = Feature.makeClassName(features);
-      classNameToFeatures.put(encode(className), ImmutableSet.copyOf(features));
+      var features = getFeatures(combination);
+      var className = Feature.makeClassName(features);
+      classNameToFeatures.put(encode(className), features);
     }
+    return classNameToFeatures;
   }
 
-  private void addNodeSpec(String className, boolean isFinal, Set<Feature> features) {
+  @SuppressWarnings("SetsImmutableEnumSetIterable")
+  private ImmutableSet<Feature> getFeatures(List<Object> combination) {
+    var features = new LinkedHashSet<Feature>();
+    features.add((Feature) combination.get(0));
+    features.add((Feature) combination.get(1));
+    for (int i = 2; i < combination.size(); i++) {
+      if ((Boolean) combination.get(i)) {
+        features.add(featureByIndex[i]);
+      }
+    }
+    if (features.contains(Feature.MAXIMUM_WEIGHT)) {
+      features.remove(Feature.MAXIMUM_SIZE);
+    }
+    // In featureByIndex order for class naming
+    return ImmutableSet.copyOf(features);
+  }
+
+  @SuppressWarnings("SetsImmutableEnumSetIterable")
+  private TypeSpec makeNodeSpec(String className, boolean isFinal, ImmutableSet<Feature> features) {
     TypeName superClass;
-    Set<Feature> parentFeatures;
-    Set<Feature> generateFeatures;
+    ImmutableSet<Feature> parentFeatures;
+    ImmutableSet<Feature> generateFeatures;
     if (features.size() == 2) {
       parentFeatures = ImmutableSet.of();
       generateFeatures = features;
       superClass = TypeName.OBJECT;
     } else {
+      // Requires that parentFeatures is in featureByIndex order for super class naming
       parentFeatures = ImmutableSet.copyOf(Iterables.limit(features, features.size() - 1));
-      generateFeatures = ImmutableSet.of(Iterables.getLast(features));
-      superClass = ParameterizedTypeName.get(ClassName.get(PACKAGE_NAME + ".NodeFactory",
+      generateFeatures = Sets.immutableEnumSet(features.asList().get(features.size() - 1));
+      superClass = ParameterizedTypeName.get(ClassName.get(PACKAGE_NAME,
           encode(Feature.makeClassName(parentFeatures))), kTypeVar, vTypeVar);
     }
 
-    NodeContext context = new NodeContext(superClass, className,
-        isFinal, parentFeatures, generateFeatures);
+    var context = new NodeContext(superClass, className, isFinal, parentFeatures, generateFeatures);
     for (NodeRule rule : rules) {
-      rule.accept(context);
+      if (rule.applies(context)) {
+        rule.execute(context);
+      }
     }
-    nodeFactory.addType(context.nodeSubtype.build());
-    addEnumConstant(className, features);
+    return context.build();
   }
 
-  private void addEnumConstant(String className, Set<Feature> features) {
-    String statementWithKey = makeFactoryStatementKey();
-    String statementWithKeyRef = makeFactoryStatementKeyRef();
-    TypeSpec.Builder typeSpec = TypeSpec.anonymousClassBuilder("")
-        .addMethod(newNodeByKey()
-            .addStatement(statementWithKey, className).build())
-        .addMethod(newNodeByKeyRef()
-            .addStatement(statementWithKeyRef, className).build());
-    if (features.contains(Feature.WEAK_KEYS)) {
-      typeSpec.addMethod(makeNewLookupKey());
-      typeSpec.addMethod(makeReferenceKey());
-    }
-    nodeFactory.addEnumConstant(className, typeSpec.build());
-  }
+  private static Set<List<Object>> combinations() {
+    var keyStrengths = Set.of(Feature.STRONG_KEYS, Feature.WEAK_KEYS);
+    var valueStrengths = Set.of(Feature.STRONG_VALUES, Feature.WEAK_VALUES, Feature.SOFT_VALUES);
+    var expireAfterAccess = Set.of(false, true);
+    var expireAfterWrite = Set.of(false, true);
+    var refreshAfterWrite = Set.of(false, true);
+    var maximumSize = Set.of(false, true);
+    var weighed = Set.of(false, true);
 
-  private String makeFactoryStatementKey() {
-    return "return new $N<>(key, keyReferenceQueue, value, valueReferenceQueue, weight, now)";
-  }
-
-  private String makeFactoryStatementKeyRef() {
-    return "return new $N<>(keyReference, value, valueReferenceQueue, weight, now)";
-  }
-
-  private MethodSpec makeNewLookupKey() {
-    return MethodSpec.methodBuilder("newLookupKey")
-        .addTypeVariable(kTypeVar)
-        .addParameter(kTypeVar, "key")
-        .addStatement("return new $T(key)", lookupKeyType)
-        .returns(Object.class)
-        .build();
-  }
-
-  private MethodSpec makeReferenceKey() {
-    return MethodSpec.methodBuilder("newReferenceKey")
-        .addTypeVariable(kTypeVar)
-        .addParameter(kTypeVar, "key")
-        .addParameter(kRefQueueType, "referenceQueue")
-        .addStatement("return new $T($L, $L)", referenceKeyType, "key", "referenceQueue")
-        .returns(Object.class)
-        .build();
-  }
-
-  private Set<List<Object>> combinations() {
-    Set<Feature> keyStrengths = ImmutableSet.of(Feature.STRONG_KEYS, Feature.WEAK_KEYS);
-    Set<Feature> valueStrengths = ImmutableSet.of(
-        Feature.STRONG_VALUES, Feature.WEAK_VALUES, Feature.SOFT_VALUES);
-    Set<Boolean> expireAfterAccess = ImmutableSet.of(false, true);
-    Set<Boolean> expireAfterWrite = ImmutableSet.of(false, true);
-    Set<Boolean> refreshAfterWrite = ImmutableSet.of(false, true);
-    Set<Boolean> maximumSize = ImmutableSet.of(false, true);
-    Set<Boolean> weighed = ImmutableSet.of(false, true);
-
-    @SuppressWarnings("unchecked")
-    Set<List<Object>> combinations = Sets.cartesianProduct(keyStrengths, valueStrengths,
+    return Sets.cartesianProduct(keyStrengths, valueStrengths,
         expireAfterAccess, expireAfterWrite, refreshAfterWrite, maximumSize, weighed);
-    return combinations;
-  }
-
-  private MethodSpec.Builder newNodeByKey() {
-    return completeNewNode(MethodSpec.methodBuilder("newNode")
-        .addParameter(keySpec)
-        .addParameter(keyRefQueueSpec));
-  }
-
-  private MethodSpec.Builder newNodeByKeyRef() {
-    return completeNewNode(MethodSpec.methodBuilder("newNode").addParameter(keyRefSpec));
-  }
-
-  private MethodSpec.Builder completeNewNode(MethodSpec.Builder method) {
-    return method
-        .addTypeVariable(kTypeVar)
-        .addTypeVariable(vTypeVar)
-        .addParameter(valueSpec)
-        .addParameter(valueRefQueueSpec)
-        .addParameter(int.class, "weight")
-        .addParameter(long.class, "now")
-        .returns(Specifications.NODE);
   }
 
   /** Returns an encoded form of the class name for compact use. */
   private static String encode(String className) {
     return Feature.makeEnumName(className)
-        .replaceFirst("STRONG_KEYS", "S")
-        .replaceFirst("WEAK_KEYS", "W")
-        .replaceFirst("_STRONG_VALUES", "St")
+        .replaceFirst("STRONG_KEYS", "P") // puissant
+        .replaceFirst("WEAK_KEYS", "F") // faible
+        .replaceFirst("_STRONG_VALUES", "S")
         .replaceFirst("_WEAK_VALUES", "W")
-        .replaceFirst("_SOFT_VALUES", "So")
+        .replaceFirst("_SOFT_VALUES", "D") // doux
         .replaceFirst("_EXPIRE_ACCESS", "A")
         .replaceFirst("_EXPIRE_WRITE", "W")
         .replaceFirst("_REFRESH_WRITE", "R")
@@ -374,6 +219,6 @@ public final class NodeFactoryGenerator {
   }
 
   public static void main(String[] args) throws IOException {
-    new NodeFactoryGenerator(Paths.get(args[0])).generate();
+    new NodeFactoryGenerator(Path.of(args[0])).generate();
   }
 }

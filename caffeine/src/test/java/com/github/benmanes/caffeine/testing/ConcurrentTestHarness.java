@@ -19,13 +19,17 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Phaser;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
+import com.google.common.base.Throwables;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.google.common.util.concurrent.Uninterruptibles;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 
 /**
  * A testing harness for concurrency related executions.
@@ -35,15 +39,18 @@ import com.google.common.util.concurrent.Uninterruptibles;
  * thread. This harness can be used for performance tests, investigations of
  * lock contention, etc.
  * <p/>
- * This code was adapted from <tt>Java Concurrency in Practice</tt>, using an
+ * This code was adapted from <code>Java Concurrency in Practice</code>, using an
  * example of a {@link CountDownLatch} for starting and stopping threads in
  * timing tests.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
 public final class ConcurrentTestHarness {
-  private static final Executor executor = Executors.newCachedThreadPool(
-      new ThreadFactoryBuilder().setDaemon(true).build());
+  public static final ThreadFactory DAEMON_FACTORY = new ThreadFactoryBuilder()
+      .setPriority(Thread.MIN_PRIORITY).setDaemon(true).build();
+  public static final ScheduledExecutorService scheduledExecutor =
+      Executors.newSingleThreadScheduledExecutor(DAEMON_FACTORY);
+  public static final ExecutorService executor = Executors.newCachedThreadPool(DAEMON_FACTORY);
 
   private ConcurrentTestHarness() {}
 
@@ -52,20 +59,9 @@ public final class ConcurrentTestHarness {
     executor.execute(task);
   }
 
-  /**
-   * Executes a task, on N threads, all starting at the same time.
-   *
-   * @param nThreads the number of threads to execute
-   * @param task the task to execute in each thread
-   */
-  public static void execute(int nThreads, Runnable task) {
-    Phaser startGate = new Phaser(nThreads);
-    for (int i = 0; i < nThreads; i++) {
-      executor.execute(() -> {
-        startGate.arriveAndAwaitAdvance();
-        task.run();
-      });
-    }
+  /** Submits the task using the shared thread pool and returns a future representing its result. */
+  public static Future<?> submit(Runnable task) {
+    return executor.submit(task);
   }
 
   /**
@@ -75,6 +71,7 @@ public final class ConcurrentTestHarness {
    * @param task the task to execute in each thread
    * @return the execution time for all threads to complete, in nanoseconds
    */
+  @CanIgnoreReturnValue
   public static long timeTasks(int nThreads, Runnable task) {
     return timeTasks(nThreads, Executors.callable(task)).executionTime();
   }
@@ -86,22 +83,27 @@ public final class ConcurrentTestHarness {
    * @param task the task to execute in each thread
    * @return the result of each task and the full execution time, in nanoseconds
    */
+  @CanIgnoreReturnValue
+  @SuppressWarnings("InterruptedExceptionSwallowed")
   public static <T> TestResult<T> timeTasks(int nThreads, Callable<T> task) {
-    CountDownLatch startGate = new CountDownLatch(1);
-    CountDownLatch endGate = new CountDownLatch(nThreads);
-    AtomicReferenceArray<T> results = new AtomicReferenceArray<T>(nThreads);
+    var startGate = new CountDownLatch(1);
+    var endGate = new CountDownLatch(nThreads);
+    var results = new AtomicReferenceArray<T>(nThreads);
 
     for (int i = 0; i < nThreads; i++) {
-      final int index = i;
+      int index = i;
       executor.execute(() -> {
         try {
           startGate.await();
           try {
             results.set(index, task.call());
+          } catch (Exception e) {
+            Throwables.throwIfUnchecked(e);
+            throw new RuntimeException(e);
           } finally {
             endGate.countDown();
           }
-        } catch (Exception e) {
+        } catch (InterruptedException e) {
           throw new RuntimeException(e);
         }
       });
@@ -111,7 +113,7 @@ public final class ConcurrentTestHarness {
     startGate.countDown();
     Uninterruptibles.awaitUninterruptibly(endGate);
     long end = System.nanoTime();
-    return new TestResult<T>(end - start, toList(results));
+    return new TestResult<>(end - start, toList(results));
   }
 
   /**
@@ -122,7 +124,7 @@ public final class ConcurrentTestHarness {
    * @return the per-thread results as a standard collection
    */
   private static <T> List<T> toList(AtomicReferenceArray<T> data) {
-    List<T> list = new ArrayList<>(data.length());
+    var list = new ArrayList<T>(data.length());
     for (int i = 0; i < data.length(); i++) {
       list.add(data.get(i));
     }

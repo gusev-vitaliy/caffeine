@@ -15,18 +15,21 @@
  */
 package com.github.benmanes.caffeine.cache.stats;
 
+import static java.util.Objects.requireNonNull;
+
 import java.util.concurrent.atomic.LongAdder;
 
-import javax.annotation.Nonnegative;
-import javax.annotation.Nonnull;
+import org.jspecify.annotations.NullMarked;
 
 import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.RemovalCause;
 
 /**
  * A thread-safe {@link StatsCounter} implementation for use by {@link Cache} implementors.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@NullMarked
 public final class ConcurrentStatsCounter implements StatsCounter {
   private final LongAdder hitCount;
   private final LongAdder missCount;
@@ -34,6 +37,7 @@ public final class ConcurrentStatsCounter implements StatsCounter {
   private final LongAdder loadFailureCount;
   private final LongAdder totalLoadTime;
   private final LongAdder evictionCount;
+  private final LongAdder evictionWeight;
 
   /**
    * Constructs an instance with all counts initialized to zero.
@@ -45,44 +49,53 @@ public final class ConcurrentStatsCounter implements StatsCounter {
     loadFailureCount = new LongAdder();
     totalLoadTime = new LongAdder();
     evictionCount = new LongAdder();
+    evictionWeight = new LongAdder();
   }
 
   @Override
-  public void recordHits(@Nonnegative int count) {
+  public void recordHits(int count) {
     hitCount.add(count);
   }
 
   @Override
-  public void recordMisses(@Nonnegative int count) {
+  public void recordMisses(int count) {
     missCount.add(count);
   }
 
   @Override
-  public void recordLoadSuccess(@Nonnegative long loadTime) {
+  public void recordLoadSuccess(long loadTime) {
     loadSuccessCount.increment();
     totalLoadTime.add(loadTime);
   }
 
   @Override
-  public void recordLoadFailure(@Nonnegative long loadTime) {
+  public void recordLoadFailure(long loadTime) {
     loadFailureCount.increment();
     totalLoadTime.add(loadTime);
   }
 
   @Override
-  public void recordEviction() {
+  public void recordEviction(int weight, RemovalCause cause) {
+    requireNonNull(cause);
     evictionCount.increment();
+    evictionWeight.add(weight);
   }
 
   @Override
   public CacheStats snapshot() {
-    return new CacheStats(
-        hitCount.sum(),
-        missCount.sum(),
-        loadSuccessCount.sum(),
-        loadFailureCount.sum(),
-        totalLoadTime.sum(),
-        evictionCount.sum());
+    return CacheStats.of(
+        negativeToMaxValue(hitCount.sum()),
+        negativeToMaxValue(missCount.sum()),
+        negativeToMaxValue(loadSuccessCount.sum()),
+        negativeToMaxValue(loadFailureCount.sum()),
+        negativeToMaxValue(totalLoadTime.sum()),
+        negativeToMaxValue(evictionCount.sum()),
+        negativeToMaxValue(evictionWeight.sum()));
+  }
+
+  /** Returns {@code value}, if non-negative. Otherwise, returns {@link Long#MAX_VALUE}. */
+  private static long negativeToMaxValue(long value) {
+    return (value >= 0) ? value : Long.MAX_VALUE;
   }
 
   /**
@@ -90,7 +103,7 @@ public final class ConcurrentStatsCounter implements StatsCounter {
    *
    * @param other the counter to increment from
    */
-  public void incrementBy(@Nonnull StatsCounter other) {
+  public void incrementBy(StatsCounter other) {
     CacheStats otherStats = other.snapshot();
     hitCount.add(otherStats.hitCount());
     missCount.add(otherStats.missCount());
@@ -98,6 +111,7 @@ public final class ConcurrentStatsCounter implements StatsCounter {
     loadFailureCount.add(otherStats.loadFailureCount());
     totalLoadTime.add(otherStats.totalLoadTime());
     evictionCount.add(otherStats.evictionCount());
+    evictionWeight.add(otherStats.evictionWeight());
   }
 
   @Override

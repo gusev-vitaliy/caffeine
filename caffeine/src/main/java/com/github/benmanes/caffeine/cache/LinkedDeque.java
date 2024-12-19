@@ -16,11 +16,12 @@
 package com.github.benmanes.caffeine.cache;
 
 import java.util.Comparator;
+import java.util.ConcurrentModificationException;
 import java.util.Deque;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 
-import javax.annotation.concurrent.NotThreadSafe;
+import org.jspecify.annotations.Nullable;
 
 /**
  * A linked list extension of the {@link Deque} interface where the link pointers are tightly
@@ -28,7 +29,7 @@ import javax.annotation.concurrent.NotThreadSafe;
  * to support usage. They are not thread-safe; in the absence of external synchronization, they do
  * not support concurrent access by multiple threads. Null elements are prohibited.
  * <p>
- * Most <tt>LinkedDeque</tt> operations run in constant time by assuming that the element parameter
+ * Most {@code LinkedDeque} operations run in constant time by assuming that the element parameter
  * is associated with the deque instance. Any usage that violates this assumption will result in
  * non-deterministic behavior.
  * <p>
@@ -36,15 +37,17 @@ import javax.annotation.concurrent.NotThreadSafe;
  * implementations. Each implementation must define unique names for accessing and modifying its
  * link pointers.
  * <p>
- * The iterators returned by this class are <em>not</em> <i>fail-fast</i>: If the deque is modified
- * at any time after the iterator is created, the iterator will be in an unknown state. Thus, in the
- * face of concurrent modification, the iterator risks arbitrary, non-deterministic behavior at an
- * undetermined time in the future.
+ * The iterators returned by this class are <i>fail-fast</i>: If the deque is structurally modified
+ * at any time after the iterator is created, in any way except through the iterator's own
+ * {@link Iterator#remove() remove} method, then the iterator will throw a
+ * {@link ConcurrentModificationException}. Thus, in the face of concurrent modification, the
+ * iterator fails quickly and cleanly, rather than risking arbitrary, non-deterministic behavior at
+ * an undetermined time in the future. Note that the fail-fast behavior of an iterator cannot be
+ * guaranteed and should be used only to detect bugs.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  * @param <E> the type of elements held in this collection
  */
-@NotThreadSafe
 interface LinkedDeque<E> extends Deque<E> {
 
   /**
@@ -52,14 +55,14 @@ interface LinkedDeque<E> extends Deque<E> {
    *
    * @param e the linked element
    */
-  boolean isFirst(E e);
+  boolean isFirst(@Nullable E e);
 
   /**
    * Returns if the element is at the back of the deque.
    *
    * @param e the linked element
    */
-  boolean isLast(E e);
+  boolean isLast(@Nullable E e);
 
   /**
    * Moves the element to the front of the deque so that it becomes the first element.
@@ -76,22 +79,22 @@ interface LinkedDeque<E> extends Deque<E> {
   void moveToBack(E e);
 
   /**
-   * Retrieves the previous element or <tt>null</tt> if either the element is unlinked or the first
+   * Retrieves the previous element or {@code null} if either the element is unlinked or the first
    * element on the deque.
    */
-  E getPrevious(E e);
+  @Nullable E getPrevious(E e);
 
-  /** Sets the previous element or <tt>null</tt> if there is no link. */
-  void setPrevious(E e, E prev);
+  /** Sets the previous element or {@code null} if there is no link. */
+  void setPrevious(E e, @Nullable E prev);
 
   /**
-   * Retrieves the next element or <tt>null</tt> if either the element is unlinked or the last
+   * Retrieves the next element or {@code null} if either the element is unlinked or the last
    * element on the deque.
    */
-  E getNext(E e);
+  @Nullable E getNext(E e);
 
-  /** Sets the next element or <tt>null</tt> if there is no link. */
-  void setNext(E e, E next);
+  /** Sets the next element or {@code null} if there is no link. */
+  void setNext(E e, @Nullable E next);
 
   @Override
   PeekingIterator<E> iterator();
@@ -102,11 +105,11 @@ interface LinkedDeque<E> extends Deque<E> {
   interface PeekingIterator<E> extends Iterator<E> {
 
     /** Returns the next element in the iteration, without advancing the iteration. */
-    E peek();
+    @Nullable E peek();
 
     /** Returns an iterator that returns the first iteration followed by the second iteration. */
     static <E> PeekingIterator<E> concat(PeekingIterator<E> first, PeekingIterator<E> second) {
-      return new PeekingIterator<E>() {
+      return new PeekingIterator<>() {
         @Override public boolean hasNext() {
           return first.hasNext() || second.hasNext();
         }
@@ -118,7 +121,7 @@ interface LinkedDeque<E> extends Deque<E> {
           }
           throw new NoSuchElementException();
         }
-        @Override public E peek() {
+        @Override public @Nullable E peek() {
           return first.hasNext() ? first.peek() : second.peek();
         }
       };
@@ -127,7 +130,7 @@ interface LinkedDeque<E> extends Deque<E> {
     /** Returns an iterator that selects the greater element from the backing iterators. */
     static <E> PeekingIterator<E> comparing(PeekingIterator<E> first,
           PeekingIterator<E> second, Comparator<E> comparator) {
-      return new PeekingIterator<E>() {
+      return new PeekingIterator<>() {
         @Override public boolean hasNext() {
           return first.hasNext() || second.hasNext();
         }
@@ -137,16 +140,20 @@ interface LinkedDeque<E> extends Deque<E> {
           } else if (!second.hasNext()) {
             return first.next();
           }
-          boolean greaterOrEqual = (comparator.compare(first.peek(), second.peek()) >= 0);
+          E o1 = first.peek();
+          E o2 = second.peek();
+          boolean greaterOrEqual = (comparator.compare(o1, o2) >= 0);
           return greaterOrEqual ? first.next() : second.next();
         }
-        @Override public E peek() {
+        @Override public @Nullable E peek() {
           if (!first.hasNext()) {
             return second.peek();
           } else if (!second.hasNext()) {
             return first.peek();
           }
-          boolean greaterOrEqual = (comparator.compare(first.peek(), second.peek()) >= 0);
+          E o1 = first.peek();
+          E o2 = second.peek();
+          boolean greaterOrEqual = (comparator.compare(o1, o2) >= 0);
           return greaterOrEqual ? first.peek() : second.peek();
         }
       };

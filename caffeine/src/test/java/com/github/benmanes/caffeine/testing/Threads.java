@@ -15,79 +15,74 @@
  */
 package com.github.benmanes.caffeine.testing;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.empty;
-import static org.hamcrest.Matchers.is;
+import static com.github.benmanes.caffeine.testing.ConcurrentTestHarness.executor;
+import static com.github.benmanes.caffeine.testing.ConcurrentTestHarness.timeTasks;
+import static com.google.common.collect.ImmutableList.toImmutableList;
+import static com.google.common.truth.Truth.assertThat;
+import static java.util.Locale.US;
 import static org.testng.Assert.fail;
 
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
-import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-import org.testng.log4testng.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.MoreExecutors;
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
- * Shared utilities for multi-threaded tests.
+ * Shared utilities for multithreaded tests.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
 public final class Threads {
-  private static final Logger logger = Logger.getLogger(Threads.class);
+  private static final Logger logger = LoggerFactory.getLogger(Threads.class);
 
-  public static final int ITERATIONS = 40000;
+  public static final int ITERATIONS = 40_000;
   public static final int NTHREADS = 20;
   public static final int TIMEOUT = 30;
 
   private Threads() {}
 
-  public static <A> void runTest(A collection, List<BiConsumer<A, Integer>> operations) {
-    Queue<String> failures = new ConcurrentLinkedQueue<>();
-    Runnable thrasher = new Thrasher<A>(collection, failures, operations);
-    Threads.executeWithTimeOut(failures, () ->
-        ConcurrentTestHarness.timeTasks(Threads.NTHREADS, thrasher));
-    assertThat(failures, is(empty()));
+  public static <A> void runTest(A collection, ImmutableList<BiConsumer<A, Int>> operations) {
+    var failures = new ConcurrentLinkedQueue<String>();
+    var thrasher = new Thrasher<A>(collection, failures, operations);
+    Threads.executeWithTimeOut(failures, () -> timeTasks(Threads.NTHREADS, thrasher));
+    assertThat(failures).isEmpty();
   }
 
   public static void executeWithTimeOut(Queue<String> failures, Callable<Long> task) {
-    ExecutorService es = Executors.newSingleThreadExecutor(
-        new ThreadFactoryBuilder().setDaemon(true).build());
-    Future<Long> future = es.submit(task);
     try {
-      long timeNS = future.get(TIMEOUT, TimeUnit.SECONDS);
-      logger.debug("\nExecuted in " + TimeUnit.NANOSECONDS.toSeconds(timeNS) + " second(s)");
+      var future = executor.submit(task);
+      long nanos = future.get(TIMEOUT, TimeUnit.SECONDS);
+      logger.debug("\nExecuted in {} second(s)", TimeUnit.NANOSECONDS.toSeconds(nanos));
     } catch (ExecutionException e) {
-      fail("Exception during test: " + e.toString(), e);
+      fail("Exception during test: " + e, e);
     } catch (TimeoutException e) {
-      handleTimout(failures, es, e);
+      handleTimeout(failures, executor, e);
     } catch (InterruptedException e) {
       fail("", e);
     }
   }
 
-  public static void handleTimout(Queue<String> failures, ExecutorService es, TimeoutException e) {
-    for (StackTraceElement[] trace : Thread.getAllStackTraces().values()) {
-      for (StackTraceElement element : trace) {
-        logger.info("\tat " + element);
+  public static void handleTimeout(Queue<String> failures, ExecutorService es, TimeoutException e) {
+    for (var trace : Thread.getAllStackTraces().values()) {
+      for (var element : trace) {
+        logger.info("\tat {}", element);
       }
       if (trace.length > 0) {
         logger.info("------");
@@ -100,10 +95,11 @@ public final class Threads {
     fail("Spun forever", e);
   }
 
-  public static List<List<Integer>> workingSets(int nThreads, int iterations) {
-    List<Integer> keys = IntStream.range(0, iterations).boxed()
+  public static ImmutableList<ImmutableList<Int>> workingSets(int nThreads, int iterations) {
+    var keys = IntStream.range(0, iterations)
         .map(i -> ThreadLocalRandom.current().nextInt(iterations / 100))
-        .collect(Collectors.toList());
+        .mapToObj(Int::valueOf)
+        .collect(toImmutableList());
     return shuffle(nThreads, keys);
   }
 
@@ -113,10 +109,10 @@ public final class Threads {
    * @param samples the number of variants to create
    * @param baseline the base working set to build from
    */
-  private static <T> List<List<T>> shuffle(int samples, Collection<T> baseline) {
-    List<List<T>> workingSets = new ArrayList<>(samples);
+  private static <T> ImmutableList<ImmutableList<T>> shuffle(int samples, Collection<T> baseline) {
+    var workingSets = new ArrayList<ImmutableList<T>>(samples);
+    var workingSet = new ArrayList<T>(baseline);
     for (int i = 0; i < samples; i++) {
-      List<T> workingSet = new ArrayList<>(baseline);
       Collections.shuffle(workingSet);
       workingSets.add(ImmutableList.copyOf(workingSet));
     }
@@ -125,13 +121,14 @@ public final class Threads {
 
   /** Executes operations against the cache to simulate random load. */
   public static final class Thrasher<A> implements Runnable {
-    private final List<BiConsumer<A, Integer>> operations;
-    private final List<List<Integer>> sets;
+    private final ImmutableList<BiConsumer<A, Int>> operations;
+    private final ImmutableList<ImmutableList<Int>> sets;
     private final Queue<String> failures;
     private final AtomicInteger index;
     private final A collection;
 
-    public Thrasher(A collection, Queue<String> failures, List<BiConsumer<A, Integer>> operations) {
+    public Thrasher(A collection, Queue<String> failures,
+        ImmutableList<BiConsumer<A, Int>> operations) {
       this.sets = workingSets(Threads.NTHREADS, Threads.ITERATIONS);
       this.index = new AtomicInteger();
       this.operations = operations;
@@ -142,13 +139,12 @@ public final class Threads {
     @Override
     public void run() {
       int id = index.getAndIncrement();
-      for (Integer e : sets.get(id)) {
-        BiConsumer<A, Integer> operation = operations.get(
-            ThreadLocalRandom.current().nextInt(operations.size()));
+      for (Int e : sets.get(id)) {
+        var operation = operations.get(ThreadLocalRandom.current().nextInt(operations.size()));
         try {
           operation.accept(collection, e);
         } catch (Throwable t) {
-          failures.add(String.format("Failed: key %s on operation %s%n%s",
+          failures.add(String.format(US, "Failed: key %s on operation %s%n%s",
               e, operation, Throwables.getStackTraceAsString(t)));
           throw t;
         }

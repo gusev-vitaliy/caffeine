@@ -15,8 +15,7 @@
  */
 package com.github.benmanes.caffeine.cache;
 
-import javax.annotation.Nonnull;
-import javax.annotation.concurrent.ThreadSafe;
+import org.jspecify.annotations.NullMarked;
 
 /**
  * A time source that returns a time value representing the number of nanoseconds elapsed since some
@@ -24,7 +23,8 @@ import javax.annotation.concurrent.ThreadSafe;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-@ThreadSafe
+@NullMarked
+@FunctionalInterface
 public interface Ticker {
 
   /**
@@ -39,7 +39,7 @@ public interface Ticker {
    *
    * @return a ticker that reads the current time using {@link System#nanoTime}
    */
-  static @Nonnull Ticker systemTicker() {
+  static Ticker systemTicker() {
     return SystemTicker.INSTANCE;
   }
 
@@ -48,7 +48,7 @@ public interface Ticker {
    *
    * @return a ticker that always returns {@code 0}
    */
-  static @Nonnull Ticker disabledTicker() {
+  static Ticker disabledTicker() {
     return DisabledTicker.INSTANCE;
   }
 }

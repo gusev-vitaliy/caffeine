@@ -15,25 +15,21 @@
  */
 package com.github.benmanes.caffeine.cache.simulator.policy.product;
 
-import java.io.PrintStream;
+import static com.github.benmanes.caffeine.cache.simulator.policy.Policy.Characteristic.WEIGHTED;
+
 import java.util.Set;
 import java.util.logging.Level;
-import java.util.logging.LogManager;
 import java.util.logging.Logger;
 
 import org.cache2k.Cache;
-import org.cache2k.CacheBuilder;
-import org.cache2k.impl.ArcCache;
-import org.cache2k.impl.ClockCache;
-import org.cache2k.impl.ClockProPlusCache;
-import org.cache2k.impl.LruCache;
-import org.cache2k.impl.RandomCache;
+import org.cache2k.Cache2kBuilder;
+import org.cache2k.event.CacheEntryEvictedListener;
 
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
+import com.github.benmanes.caffeine.cache.simulator.policy.AccessEvent;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.io.ByteStreams;
 import com.typesafe.config.Config;
 
 /**
@@ -41,48 +37,43 @@ import com.typesafe.config.Config;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@PolicySpec(name = "product.Cache2k", characteristics = WEIGHTED)
 public final class Cache2kPolicy implements Policy {
-  private final Cache<Object, Object> cache;
+  private static final Logger logger = Logger.getLogger("org.cache2k");
+
+  private final Cache<Long, AccessEvent> cache;
   private final PolicyStats policyStats;
-  private final int maximumSize;
 
-  public Cache2kPolicy(Config config) {
-    Logger logger = LogManager.getLogManager().getLogger("");
-    Level level = logger.getLevel();
-    logger.setLevel(Level.OFF);
-    PrintStream err = System.err;
-    System.setErr(new PrintStream(ByteStreams.nullOutputStream()));
-    try {
-      this.policyStats = new PolicyStats("product.Cache2k");
-      Cache2kSettings settings = new Cache2kSettings(config);
-      cache = CacheBuilder.newCache(Object.class, Object.class)
-          .implementation(settings.implementation())
-          .maxSize(settings.maximumSize())
-          .eternal(true)
-          .build();
-      maximumSize = settings.maximumSize();
-    } finally {
-      System.setErr(err);
-      LogManager.getLogManager().getLogger("").setLevel(level);
+  public Cache2kPolicy(Config config, Set<Characteristic> characteristics) {
+    logger.setLevel(Level.WARNING);
+
+    policyStats = new PolicyStats(name());
+    var settings = new BasicSettings(config);
+    CacheEntryEvictedListener<Long, AccessEvent> listener =
+        (cache, entry) -> policyStats.recordEviction();
+    var builder = Cache2kBuilder.of(Long.class, AccessEvent.class)
+        .addListener(listener)
+        .strictEviction(true);
+    if (characteristics.contains(WEIGHTED)) {
+      builder.weigher((Long key, AccessEvent value) -> value.weight());
+      builder.maximumWeight(settings.maximumSize());
+    } else {
+      builder.entryCapacity(settings.maximumSize());
     }
-  }
-
-  /** Returns all variations of this policy based on the configuration parameters. */
-  public static Set<Policy> policies(Config config) {
-    return ImmutableSet.of(new Cache2kPolicy(config));
+    cache = builder.build();
   }
 
   @Override
-  public void record(long key) {
-    Object value = cache.peek(key);
+  public void record(AccessEvent event) {
+    AccessEvent value = cache.peek(event.key());
     if (value == null) {
-      policyStats.recordMiss();
-      if (cache.getTotalEntryCount() == maximumSize) {
-        policyStats.recordEviction();
-      }
-      cache.put(key, key);
+      cache.put(event.key(), event);
+      policyStats.recordWeightedMiss(event.weight());
     } else {
-      policyStats.recordHit();
+      policyStats.recordWeightedHit(event.weight());
+      if (event.weight() != value.weight()) {
+        cache.put(event.key(), event);
+      }
     }
   }
 
@@ -91,26 +82,8 @@ public final class Cache2kPolicy implements Policy {
     return policyStats;
   }
 
-  static final class Cache2kSettings extends BasicSettings {
-    public Cache2kSettings(Config config) {
-      super(config);
-    }
-    public Class<?> implementation() {
-      String policy = config().getString("cache2k.policy").toLowerCase();
-      switch (policy) {
-        case "arc":
-          return ArcCache.class;
-        case "clock":
-          return ClockCache.class;
-        case "clockpro":
-          return ClockProPlusCache.class;
-        case "lru":
-          return LruCache.class;
-        case "random":
-          return RandomCache.class;
-        default:
-          throw new IllegalArgumentException("Unknown policy type: " + policy);
-      }
-    }
+  @Override
+  public void finished() {
+    cache.close();
   }
 }

@@ -15,44 +15,49 @@
  */
 package com.github.benmanes.caffeine.cache;
 
+import static com.github.benmanes.caffeine.cache.BoundedLocalCache.MAXIMUM_EXPIRY;
 import static java.util.Objects.requireNonNull;
 
 import java.io.Serializable;
-import java.util.Map;
+import java.lang.System.Logger;
+import java.lang.System.Logger.Level;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 
-import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Static utility methods and classes pertaining to asynchronous operations.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@SuppressWarnings("serial")
 final class Async {
+  static final long ASYNC_EXPIRY = (Long.MAX_VALUE >> 1) + (Long.MAX_VALUE >> 2); // 220 years
+  static final Logger logger = System.getLogger(Async.class.getName());
 
   private Async() {}
 
   /** Returns if the future has successfully completed. */
   static boolean isReady(@Nullable CompletableFuture<?> future) {
-    return (future != null) && future.isDone() && !future.isCompletedExceptionally();
+    return (future != null) && future.isDone()
+        && !future.isCompletedExceptionally()
+        && (future.join() != null);
   }
 
   /** Returns the current value or null if either not done or failed. */
-  static @Nullable <V> V getIfReady(@Nullable CompletableFuture<V> future) {
+  @SuppressWarnings("NullAway")
+  static <V> @Nullable V getIfReady(@Nullable CompletableFuture<V> future) {
     return isReady(future) ? future.join() : null;
   }
 
   /** Returns the value when completed successfully or null if failed. */
-  static @Nullable <V> V getWhenSuccessful(@Nullable CompletableFuture<V> future) {
+  static <V> @Nullable V getWhenSuccessful(@Nullable CompletableFuture<V> future) {
     try {
-      return (future == null) ? null : future.get();
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      return null;
-    } catch (ExecutionException e) {
+      return (future == null) ? null : future.join();
+    } catch (CancellationException | CompletionException e) {
       return null;
     }
   }
@@ -74,10 +79,49 @@ final class Async {
     }
 
     @Override
-    public void onRemoval(K key, @Nonnull CompletableFuture<V> future, RemovalCause cause) {
-      future.thenAcceptAsync(value -> {
+    @SuppressWarnings("FutureReturnValueIgnored")
+    public void onRemoval(@Nullable K key,
+        @Nullable CompletableFuture<V> future, RemovalCause cause) {
+      if (future != null) {
+        future.thenAcceptAsync(value -> {
+          if (value != null) {
+            try {
+              delegate.onRemoval(key, value, cause);
+            } catch (Throwable t) {
+              logger.log(Level.WARNING, "Exception thrown by removal listener", t);
+            }
+          }
+        }, executor);
+      }
+    }
+
+    Object writeReplace() {
+      return delegate;
+    }
+  }
+
+  /**
+   * An eviction listener that forwards the value stored in a {@link CompletableFuture} to the
+   * user-supplied eviction listener.
+   */
+  static final class AsyncEvictionListener<K, V>
+      implements RemovalListener<K, CompletableFuture<V>>, Serializable {
+    private static final long serialVersionUID = 1L;
+
+    final RemovalListener<K, V> delegate;
+
+    AsyncEvictionListener(RemovalListener<K, V> delegate) {
+      this.delegate = requireNonNull(delegate);
+    }
+
+    @Override
+    public void onRemoval(@Nullable K key,
+        @Nullable CompletableFuture<V> future, RemovalCause cause) {
+      // Must have been completed and be non-null to be eligible for eviction
+      V value = Async.getIfReady(future);
+      if (value != null) {
         delegate.onRemoval(key, value, cause);
-      }, executor);
+      }
     }
 
     Object writeReplace() {
@@ -88,9 +132,9 @@ final class Async {
   /**
    * A weigher for asynchronous computations. When the value is being loaded this weigher returns
    * {@code 0} to indicate that the entry should not be evicted due to a size constraint. If the
-   * value is computed successfully the entry must be reinserted so that the weight is updated and
-   * the expiration timeouts reflect the value once present. This can be done safely using
-   * {@link Map#replace(Object, Object, Object)}.
+   * value is computed successfully then the entry must be reinserted so that the weight is updated
+   * and the expiration timeouts reflect the value once present. This can be done safely using
+   * {@link java.util.Map#replace(Object, Object, Object)}.
    */
   static final class AsyncWeigher<K, V> implements Weigher<K, CompletableFuture<V>>, Serializable {
     private static final long serialVersionUID = 1L;
@@ -104,6 +148,58 @@ final class Async {
     @Override
     public int weigh(K key, CompletableFuture<V> future) {
       return isReady(future) ? delegate.weigh(key, future.join()) : 0;
+    }
+
+    Object writeReplace() {
+      return delegate;
+    }
+  }
+
+  /**
+   * An expiry for asynchronous computations. When the value is being loaded this expiry returns
+   * {@code ASYNC_EXPIRY} to indicate that the entry should not be evicted due to an expiry
+   * constraint. If the value is computed successfully then the entry must be reinserted so that the
+   * expiration is updated and the expiration timeouts reflect the value once present. The
+   * duration's maximum range is reserved to coordinate with the asynchronous life cycle.
+   */
+  static final class AsyncExpiry<K, V> implements Expiry<K, CompletableFuture<V>>, Serializable {
+    private static final long serialVersionUID = 1L;
+
+    final Expiry<? super K, ? super V> delegate;
+
+    AsyncExpiry(Expiry<? super K, ? super V> delegate) {
+      this.delegate = requireNonNull(delegate);
+    }
+
+    @Override
+    public long expireAfterCreate(K key, CompletableFuture<V> future, long currentTime) {
+      if (isReady(future)) {
+        long duration = delegate.expireAfterCreate(key, future.join(), currentTime);
+        return Math.min(duration, MAXIMUM_EXPIRY);
+      }
+      return ASYNC_EXPIRY;
+    }
+
+    @Override
+    public long expireAfterUpdate(K key, CompletableFuture<V> future,
+        long currentTime, long currentDuration) {
+      if (isReady(future)) {
+        long duration = (currentDuration > MAXIMUM_EXPIRY)
+            ? delegate.expireAfterCreate(key, future.join(), currentTime)
+            : delegate.expireAfterUpdate(key, future.join(), currentTime, currentDuration);
+        return Math.min(duration, MAXIMUM_EXPIRY);
+      }
+      return ASYNC_EXPIRY;
+    }
+
+    @Override
+    public long expireAfterRead(K key, CompletableFuture<V> future,
+        long currentTime, long currentDuration) {
+      if (isReady(future)) {
+        long duration = delegate.expireAfterRead(key, future.join(), currentTime, currentDuration);
+        return Math.min(duration, MAXIMUM_EXPIRY);
+      }
+      return ASYNC_EXPIRY;
     }
 
     Object writeReplace() {

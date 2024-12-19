@@ -15,8 +15,7 @@
  */
 package com.github.benmanes.caffeine.cache.simulator.policy.linked;
 
-import static com.google.common.base.Preconditions.checkState;
-import static java.util.stream.Collectors.toSet;
+import static java.util.stream.Collectors.toUnmodifiableSet;
 
 import java.util.Set;
 
@@ -24,6 +23,8 @@ import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
 import com.github.benmanes.caffeine.cache.simulator.admission.Admission;
 import com.github.benmanes.caffeine.cache.simulator.admission.Admittor;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
 import com.google.common.base.MoreObjects;
 import com.typesafe.config.Config;
@@ -43,44 +44,46 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  * The protected segment is finite in size. When it gets full, the overflowed will be re-cached in
  * probationary segment. Since objects in protected segment have to go a longer way before being
  * evicted, popular object or an object with more accesses tends to be kept in cache for longer
- * time." from <a href="
- * http://www.is.kyusan-u.ac.jp/~chengk/pub/papers/compsac00_A07-07.pdf">LRU-SP: A Size-Adjusted and
- * Popularity-Aware LRU Replacement Algorithm for Web Caching</a>
+ * time." from
+ * <a href="https://citeseerx.ist.psu.edu/document?doi=111f5bf8d3c528759e1ae7db0cd4af746d5b4c5b">
+ * LRU-SP: A Size-Adjusted and Popularity-Aware LRU Replacement Algorithm for Web Caching</a>. The
+ * algorithm is described by its authors in <a href="https://ieeexplore.ieee.org/document/268884">
+ * Caching Strategies to Improve Disk System Performance</a>.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class SegmentedLruPolicy implements Policy {
-  private static final Node UNLINKED = new Node();
+@PolicySpec(name = "linked.SegmentedLru")
+public final class SegmentedLruPolicy implements KeyOnlyPolicy {
+  static final Node UNLINKED = new Node();
 
-  private final Long2ObjectMap<Node> data;
-  private final PolicyStats policyStats;
-  private final Node headProtected;
-  private final Node headProbation;
-  private final Admittor admittor;
-  private final int maxProtected;
-  private final int maximumSize;
+  final Long2ObjectMap<Node> data;
+  final PolicyStats policyStats;
+  final Node headProtected;
+  final Node headProbation;
+  final Admittor admittor;
+  final int maxProtected;
+  final int maximumSize;
 
-  private int sizeProtected;
+  int sizeProtected;
 
   public SegmentedLruPolicy(Admission admission, Config config) {
-    SegmentedLruSettings settings = new SegmentedLruSettings(config);
-    String name = admission.format("linked.SegmentedLru");
+    this.policyStats = new PolicyStats(admission.format(name()));
+    this.admittor = admission.from(config, policyStats);
+    var settings = new SegmentedLruSettings(config);
 
     this.headProtected = new Node();
     this.headProbation = new Node();
-    this.admittor = admission.from(config);
-    this.policyStats = new PolicyStats(name);
-    this.maximumSize = settings.maximumSize();
     this.data = new Long2ObjectOpenHashMap<>();
+    this.maximumSize = Math.toIntExact(settings.maximumSize());
     this.maxProtected = (int) (maximumSize * settings.percentProtected());
   }
 
   /** Returns all variations of this policy based on the configuration parameters. */
   public static Set<Policy> policies(Config config) {
-    BasicSettings settings = new BasicSettings(config);
+    var settings = new BasicSettings(config);
     return settings.admission().stream().map(admission ->
       new SegmentedLruPolicy(admission, config)
-    ).collect(toSet());
+    ).collect(toUnmodifiableSet());
   }
 
   @Override
@@ -115,7 +118,7 @@ public final class SegmentedLruPolicy implements Policy {
   }
 
   private void onMiss(long key) {
-    Node node = new Node(key);
+    var node = new Node(key);
     data.put(key, node);
     policyStats.recordMiss();
     node.appendToTail(headProbation);
@@ -151,7 +154,7 @@ public final class SegmentedLruPolicy implements Policy {
 
   enum QueueType {
     PROTECTED,
-    PROBATION;
+    PROBATION,
   }
 
   static final class Node {
@@ -197,8 +200,6 @@ public final class SegmentedLruPolicy implements Policy {
 
     /** Removes the node from the list. */
     public void remove() {
-      checkState(key != Long.MIN_VALUE);
-
       prev.next = next;
       next.prev = prev;
       prev = next = UNLINKED; // mark as unlinked

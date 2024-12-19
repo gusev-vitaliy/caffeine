@@ -15,18 +15,26 @@
  */
 package com.github.benmanes.caffeine.cache.simulator.report;
 
-import java.io.File;
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Locale.US;
+import static java.util.Objects.requireNonNull;
+
 import java.io.IOException;
-import java.nio.file.Paths;
-import java.util.ArrayList;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
+import java.util.Set;
 
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.Characteristic;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
-import com.google.common.base.Charsets;
-import com.google.common.io.Files;
+import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats.Metric;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.typesafe.config.Config;
 
 /**
@@ -35,69 +43,67 @@ import com.typesafe.config.Config;
  * @author ben.manes@gmail.com (Ben Manes)
  */
 public abstract class TextReporter implements Reporter {
-  private static final String[] HEADERS = {
-      "Policy", "Hit rate", "Hits", "Misses", "Requests", "Evictions", "Steps", "Time"};
-
-  private final List<PolicyStats> results;
+  private final Set<Characteristic> characteristics;
   private final BasicSettings settings;
 
-  public TextReporter(Config config) {
-    settings = new BasicSettings(config);
-    results = new ArrayList<>();
+  protected TextReporter(Config config, Set<Characteristic> characteristics) {
+    this.characteristics = requireNonNull(characteristics);
+    this.settings = new BasicSettings(config);
   }
 
-  /** Returns the column headers. */
-  protected String[] headers() {
-    return HEADERS.clone();
-  }
-
-  /** Adds the result of a policy simulation. */
   @Override
-  public void add(PolicyStats policyStats) {
-    results.add(policyStats);
-  }
+  public void print(List<PolicyStats> results) {
+    var sortedStats = getSortedStats(results);
+    var headers = getHeaders(sortedStats);
 
-  /** Writes the report to the output destination. */
-  @Override
-  public void print() throws IOException {
-    results.sort(comparator());
-    String report = assemble(results);
+    String report = assemble(headers, sortedStats);
     String output = settings.report().output();
     if (output.equalsIgnoreCase("console")) {
       System.out.println(report);
-    } else {
-      File file = Paths.get(output).toFile();
-      Files.write(report, file, Charsets.UTF_8);
+      return;
+    }
+    try {
+      var path = Path.of(output);
+      Files.createDirectories(path.getParent());
+      Files.write(path, report.getBytes(UTF_8));
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
     }
   }
+
+  private ImmutableList<PolicyStats> getSortedStats(Collection<PolicyStats> results) {
+    String sortBy = results.stream()
+        .flatMap(policyStats -> policyStats.metrics().keySet().stream())
+        .filter(header -> header.toLowerCase(US).equals(settings.report().sortBy().toLowerCase(US)))
+        .findAny().orElseThrow(() -> new IllegalArgumentException(
+            "Unknown sort order: " + settings.report().sortBy()));
+    return ImmutableList.sortedCopyOf(comparator(sortBy), results);
+  }
+
+  /** Returns the column headers in declaration order. */
+  private ImmutableSet<String> getHeaders(Collection<PolicyStats> results) {
+    var columns = results.stream()
+        .flatMap(policyStats -> policyStats.metrics().values().stream())
+        .filter(metric -> metric.characteristics().isEmpty()
+            || metric.characteristics().stream().anyMatch(characteristics::contains))
+        .filter(metric -> metric.required() || !metrics().format(metric).isEmpty())
+        .map(Metric::name)
+        .collect(toImmutableSet());
+    return results.stream()
+        .flatMap(policyStats -> policyStats.metrics().keySet().stream())
+        .filter(columns::contains)
+        .collect(toImmutableSet());
+  }
+
+  /** Returns the configuration for how to work with metrics. */
+  protected abstract Metrics metrics();
 
   /** Assembles an aggregated report. */
-  protected abstract String assemble(List<PolicyStats> results);
+  protected abstract String assemble(Set<String> headers, List<PolicyStats> results);
 
   /** Returns a comparator that sorts by the specified column. */
-  private Comparator<PolicyStats> comparator() {
-    Comparator<PolicyStats> comparator = makeComparator();
+  private Comparator<PolicyStats> comparator(String sortBy) {
+    Comparator<PolicyStats> comparator = metrics().comparator(sortBy);
     return settings.report().ascending() ? comparator : comparator.reversed();
-  }
-
-  private Comparator<PolicyStats> makeComparator() {
-    switch (settings.report().sortBy().toLowerCase()) {
-      case "policy":
-        return Comparator.comparing(PolicyStats::name);
-      case "hit rate":
-        return Comparator.comparingDouble(PolicyStats::hitRate);
-      case "hits":
-        return Comparator.comparingLong(PolicyStats::hitCount);
-      case "misses":
-        return Comparator.comparingLong(PolicyStats::missCount);
-      case "evictions":
-        return Comparator.comparingLong(PolicyStats::evictionCount);
-      case "steps":
-        return Comparator.comparingLong(PolicyStats::operationCount);
-      case "time":
-        return Comparator.comparingLong(stats -> stats.stopwatch().elapsed(TimeUnit.NANOSECONDS));
-      default:
-        throw new IllegalArgumentException("Unknown sort order: " + settings.report().sortBy());
-    }
   }
 }

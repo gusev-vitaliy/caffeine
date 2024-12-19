@@ -15,9 +15,8 @@
  */
 package com.github.benmanes.caffeine.cache;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.lessThanOrEqualTo;
+import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -27,55 +26,56 @@ import org.testng.annotations.Test;
 /**
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@SuppressWarnings("ClassEscapesDefinedScope")
 public final class FrequencySketchTest {
   final Integer item = ThreadLocalRandom.current().nextInt();
 
-  @Test(expectedExceptions = IllegalArgumentException.class)
-  public void construct_negative() {
-    new FrequencySketch<Integer>(-1);
-  }
-
   @Test
-  public void construct_zero() {
-    FrequencySketch<Integer> sketch = new FrequencySketch<>(0);
-    assertThat(sketch.table.length, is(1));
-    assertThat(sketch.tableMask, is(0));
+  public void construct() {
+    var sketch = new FrequencySketch<Integer>();
+    assertThat(sketch.table).isNull();
+    assertThat(sketch.isNotInitialized()).isTrue();
+
+    sketch.increment(item);
+    assertThat(sketch.frequency(item)).isEqualTo(0);
   }
 
-  @Test
-  public void construct_positive() {
-    FrequencySketch<Integer> sketch = new FrequencySketch<>(10);
-    assertThat(sketch.table.length, is(16));
-    assertThat(sketch.tableMask, is(15));
-  }
-
-  @Test(dataProvider = "sketch", expectedExceptions = IllegalArgumentException.class)
+  @Test(dataProvider = "sketch")
   public void ensureCapacity_negative(FrequencySketch<Integer> sketch) {
-    sketch.ensureCapacity(-1);
+    assertThrows(IllegalArgumentException.class, () -> sketch.ensureCapacity(-1));
   }
 
   @Test(dataProvider = "sketch")
   public void ensureCapacity_smaller(FrequencySketch<Integer> sketch) {
     int size = sketch.table.length;
     sketch.ensureCapacity(size / 2);
-    assertThat(sketch.table.length, is(size));
-    assertThat(sketch.tableMask, is(size - 1));
-    assertThat(sketch.sampleSize, is(10 * size));
+    assertThat(sketch.table).hasLength(size);
+    assertThat(sketch.sampleSize).isEqualTo(10 * size);
+    assertThat(sketch.blockMask).isEqualTo((size >> 3) - 1);
   }
 
   @Test(dataProvider = "sketch")
   public void ensureCapacity_larger(FrequencySketch<Integer> sketch) {
     int size = sketch.table.length;
-    sketch.ensureCapacity(size * 2);
-    assertThat(sketch.table.length, is(size * 2));
-    assertThat(sketch.tableMask, is(2 * size - 1));
-    assertThat(sketch.sampleSize, is(10 * 2 * size));
+    sketch.ensureCapacity(2 * size);
+    assertThat(sketch.table).hasLength(2 * size);
+    assertThat(sketch.sampleSize).isEqualTo(10 * 2 * size);
+    assertThat(sketch.blockMask).isEqualTo(((2 * size) >> 3) - 1);
+  }
+
+  @Test(dataProvider = "sketch", groups = "isolated")
+  public void ensureCapacity_maximum(FrequencySketch<Integer> sketch) {
+    int size = Integer.MAX_VALUE / 10 + 1;
+    sketch.ensureCapacity(size);
+    assertThat(sketch.sampleSize).isEqualTo(Integer.MAX_VALUE);
+    assertThat(sketch.table).hasLength(Caffeine.ceilingPowerOfTwo(size));
+    assertThat(sketch.blockMask).isEqualTo((sketch.table.length >> 3) - 1);
   }
 
   @Test(dataProvider = "sketch")
   public void increment_once(FrequencySketch<Integer> sketch) {
     sketch.increment(item);
-    assertThat(sketch.frequency(item), is(1));
+    assertThat(sketch.frequency(item)).isEqualTo(1);
   }
 
   @Test(dataProvider = "sketch")
@@ -83,22 +83,30 @@ public final class FrequencySketchTest {
     for (int i = 0; i < 20; i++) {
       sketch.increment(item);
     }
-    assertThat(sketch.frequency(item), is(15));
+    assertThat(sketch.frequency(item)).isEqualTo(15);
   }
 
   @Test(dataProvider = "sketch")
   public void increment_distinct(FrequencySketch<Integer> sketch) {
     sketch.increment(item);
     sketch.increment(item + 1);
-    assertThat(sketch.frequency(item), is(1));
-    assertThat(sketch.frequency(item + 1), is(1));
-    assertThat(sketch.frequency(item + 2), is(0));
+    assertThat(sketch.frequency(item)).isEqualTo(1);
+    assertThat(sketch.frequency(item + 1)).isEqualTo(1);
+    assertThat(sketch.frequency(item + 2)).isEqualTo(0);
+  }
+
+  @Test(dataProvider = "sketch")
+  public void increment_zero(FrequencySketch<Integer> sketch) {
+    sketch.increment(0);
+    assertThat(sketch.frequency(0)).isEqualTo(1);
   }
 
   @Test
   public void reset() {
     boolean reset = false;
-    FrequencySketch<Integer> sketch = new FrequencySketch<>(64);
+    var sketch = new FrequencySketch<Integer>();
+    sketch.ensureCapacity(64);
+
     for (int i = 1; i < 20 * sketch.table.length; i++) {
       sketch.increment(i);
       if (sketch.size != i) {
@@ -106,13 +114,30 @@ public final class FrequencySketchTest {
         break;
       }
     }
-    assertThat(reset, is(true));
-    assertThat(sketch.size, lessThanOrEqualTo(sketch.sampleSize / 2));
+    assertThat(reset).isTrue();
+    assertThat(sketch.size).isAtMost(sketch.sampleSize / 2);
+  }
+
+  @Test
+  public void full() {
+    FrequencySketch<Integer> sketch = makeSketch(512);
+    sketch.sampleSize = Integer.MAX_VALUE;
+    for (int i = 0; i < 100_000; i++) {
+      sketch.increment(i);
+    }
+    for (long slot : sketch.table) {
+      assertThat(Long.bitCount(slot)).isEqualTo(64);
+    }
+
+    sketch.reset();
+    for (long slot : sketch.table) {
+      assertThat(slot).isEqualTo(FrequencySketch.RESET_MASK);
+    }
   }
 
   @Test
   public void heavyHitters() {
-    FrequencySketch<Double> sketch = new FrequencySketch<>(512, 1033096058);
+    FrequencySketch<Double> sketch = makeSketch(512);
     for (int i = 100; i < 100_000; i++) {
       sketch.increment((double) i);
     }
@@ -129,19 +154,25 @@ public final class FrequencySketchTest {
     }
     for (int i = 0; i < popularity.length; i++) {
       if ((i == 0) || (i == 1) || (i == 3) || (i == 5) || (i == 7) || (i == 9)) {
-        assertThat(popularity[i], lessThanOrEqualTo(popularity[2]));
+        assertThat(popularity[i]).isAtMost(popularity[2]);
       } else if (i == 2) {
-        assertThat(popularity[2], lessThanOrEqualTo(popularity[4]));
+        assertThat(popularity[2]).isAtMost(popularity[4]);
       } else if (i == 4) {
-        assertThat(popularity[4], lessThanOrEqualTo(popularity[6]));
+        assertThat(popularity[4]).isAtMost(popularity[6]);
       } else if (i == 6) {
-        assertThat(popularity[6], lessThanOrEqualTo(popularity[8]));
+        assertThat(popularity[6]).isAtMost(popularity[8]);
       }
     }
   }
 
   @DataProvider(name = "sketch")
   public Object[][] providesSketch() {
-    return new Object[][] {{ new FrequencySketch<>(512) }};
+    return new Object[][] {{ makeSketch(512) }};
+  }
+
+  private static <E> FrequencySketch<E> makeSketch(long maximumSize) {
+    var sketch = new FrequencySketch<E>();
+    sketch.ensureCapacity(maximumSize);
+    return sketch;
   }
 }

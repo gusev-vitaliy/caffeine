@@ -15,113 +15,109 @@
  */
 package com.github.benmanes.caffeine.cache.node;
 
-import static com.github.benmanes.caffeine.cache.Specifications.PACKAGE_NAME;
-import static com.github.benmanes.caffeine.cache.Specifications.UNSAFE_ACCESS;
-import static com.github.benmanes.caffeine.cache.Specifications.newFieldOffset;
-import static com.github.benmanes.caffeine.cache.Specifications.offsetName;
 import static com.github.benmanes.caffeine.cache.Specifications.vRefQueueType;
 import static com.github.benmanes.caffeine.cache.Specifications.vTypeVar;
-import static com.google.common.base.Preconditions.checkState;
+import static com.github.benmanes.caffeine.cache.node.NodeContext.varHandleName;
 
 import java.lang.ref.Reference;
 import java.util.Objects;
 
 import javax.lang.model.element.Modifier;
 
-import com.github.benmanes.caffeine.cache.Feature;
+import com.github.benmanes.caffeine.cache.node.NodeContext.Strength;
 import com.squareup.javapoet.ClassName;
+import com.squareup.javapoet.CodeBlock;
 import com.squareup.javapoet.FieldSpec;
 import com.squareup.javapoet.MethodSpec;
-import com.squareup.javapoet.ParameterizedTypeName;
-import com.squareup.javapoet.TypeName;
 
 /**
  * Adds the value to the node.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class AddValue extends NodeRule {
+public final class AddValue implements NodeRule {
 
   @Override
-  protected boolean applies() {
-    return isBaseClass();
+  public boolean applies(NodeContext context) {
+    return context.isBaseClass();
   }
 
   @Override
-  protected void execute() {
+  public void execute(NodeContext context) {
     context.nodeSubtype
-        .addField(newFieldOffset(context.className, "value"))
-        .addField(newValueField())
-        .addMethod(newGetter(valueStrength(), vTypeVar, "value", Visibility.LAZY))
-        .addMethod(newGetRef("value"))
-        .addMethod(makeSetValue())
-        .addMethod(makeContainsValue());
-    addValueConstructorAssignment(context.constructorByKey, "key");
-    addValueConstructorAssignment(context.constructorByKeyRef, "keyReference");
+        .addField(newValueField(context))
+        .addMethod(makeGetValue(context))
+        .addMethod(context.newGetRef("value"))
+        .addMethod(makeSetValue(context))
+        .addMethod(makeContainsValue(context));
+    if (context.isStrongValues()) {
+      context.addVarHandle("value", ClassName.get(Object.class));
+    } else {
+      context.addVarHandle("value", context.valueReferenceType().rawType);
+    }
   }
 
-  private FieldSpec newValueField() {
-    Modifier[] modifiers = { Modifier.PRIVATE, Modifier.VOLATILE };
-    FieldSpec.Builder fieldSpec = isStrongValues()
-        ? FieldSpec.builder(vTypeVar, "value", modifiers)
-        : FieldSpec.builder(valueReferenceType(), "value", modifiers);
+  private static FieldSpec newValueField(NodeContext context) {
+    var fieldSpec = context.isStrongValues()
+        ? FieldSpec.builder(vTypeVar, "value", Modifier.VOLATILE)
+        : FieldSpec.builder(context.valueReferenceType(), "value", Modifier.VOLATILE);
     return fieldSpec.build();
   }
 
+  /** Creates the getValue method. */
+  private static MethodSpec makeGetValue(NodeContext context) {
+    var getter = MethodSpec.methodBuilder("getValue")
+        .addModifiers(context.publicFinalModifiers())
+        .returns(vTypeVar);
+    String handle = varHandleName("value");
+    if (context.valueStrength() == Strength.STRONG) {
+      getter.addStatement("return ($T) $L.get(this)", vTypeVar, handle);
+      return getter.build();
+    }
+
+    var code = CodeBlock.builder()
+        .beginControlFlow("for (;;)")
+            .addStatement("$1T<V> ref = ($1T<V>) $2L.getOpaque(this)", Reference.class, handle)
+            .addStatement("V referent = ref.get()")
+            .beginControlFlow("if ((referent != null) || (ref == $L.getAcquire(this)))", handle)
+                .addStatement("return referent")
+            .endControlFlow()
+        .endControlFlow()
+        .build();
+    return getter.addCode(code).build();
+  }
+
   /** Creates the setValue method. */
-  private MethodSpec makeSetValue() {
-    MethodSpec.Builder setter = MethodSpec.methodBuilder("setValue")
-        .addModifiers(Modifier.PUBLIC, Modifier.FINAL)
+  private static MethodSpec makeSetValue(NodeContext context) {
+    var setter = MethodSpec.methodBuilder("setValue")
+        .addModifiers(context.publicFinalModifiers())
         .addParameter(vTypeVar, "value")
         .addParameter(vRefQueueType, "referenceQueue");
 
-    if (isStrongValues()) {
-      setter.addStatement("$T.UNSAFE.putObject(this, $N, $N)",
-          UNSAFE_ACCESS, offsetName("value"), "value");
+    if (context.isStrongValues()) {
+      setter.addStatement("$L.setRelease(this, $N)", varHandleName("value"), "value");
     } else {
-      setter.addStatement("(($T<V>) getValueReference()).clear()", Reference.class);
-      setter.addStatement("$T.UNSAFE.putObject(this, $N, new $T($L, $N, referenceQueue))",
-          UNSAFE_ACCESS, offsetName("value"), valueReferenceType(), "key", "value");
+      setter.addStatement("$1T<V> ref = ($1T<V>) $2L.get(this)",
+          Reference.class, varHandleName("value"));
+      setter.addStatement("$L.setRelease(this, new $T($L, $N, referenceQueue))",
+          varHandleName("value"), context.valueReferenceType(),
+          "getKeyReference()", "value");
+      setter.addStatement("ref.clear()");
     }
 
     return setter.build();
   }
 
-  private MethodSpec makeContainsValue() {
-    MethodSpec.Builder containsValue = MethodSpec.methodBuilder("containsValue")
-        .addModifiers(Modifier.PUBLIC, Modifier.FINAL)
+  private static MethodSpec makeContainsValue(NodeContext context) {
+    var containsValue = MethodSpec.methodBuilder("containsValue")
+        .addModifiers(context.publicFinalModifiers())
         .addParameter(Object.class, "value")
         .returns(boolean.class);
-    if (isStrongValues()) {
+    if (context.isStrongValues()) {
       containsValue.addStatement("return $T.equals(value, getValue())", Objects.class);
     } else {
       containsValue.addStatement("return getValue() == value");
     }
     return containsValue.build();
-  }
-
-  private TypeName valueReferenceType() {
-    checkState(!context.generateFeatures.contains(Feature.STRONG_VALUES));
-    String clazz = context.generateFeatures.contains(Feature.WEAK_VALUES)
-        ? "WeakValueReference"
-        : "SoftValueReference";
-    return ParameterizedTypeName.get(ClassName.get(PACKAGE_NAME + ".References", clazz), vTypeVar);
-  }
-
-  /** Adds a constructor assignment. */
-  private void addValueConstructorAssignment(MethodSpec.Builder constructor, String keyName) {
-    if (isStrongValues()) {
-      constructor.addStatement("$T.UNSAFE.putObject(this, $N, $N)",
-          UNSAFE_ACCESS, offsetName("value"), "value");
-    } else {
-      constructor.addStatement("$T.UNSAFE.putObject(this, $N, new $T($N, $N, $N))",
-          UNSAFE_ACCESS, offsetName("value"), valueReferenceType(),
-          keyName, "value", "valueReferenceQueue");
-    }
-  }
-
-  private boolean isStrongValues() {
-    return context.parentFeatures.contains(Feature.STRONG_VALUES)
-        || context.generateFeatures.contains(Feature.STRONG_VALUES);
   }
 }

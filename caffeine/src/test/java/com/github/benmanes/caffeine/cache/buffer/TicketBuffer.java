@@ -17,17 +17,14 @@ package com.github.benmanes.caffeine.cache.buffer;
 
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Consumer;
-
-import com.github.benmanes.caffeine.cache.ReadBuffer;
 
 /**
  * A bounded buffer that attempts to record once. This design has the benefit of retaining a
  * strict sequence and backing off on contention or when full. It uses a PTL scheme where the empty
  * slot is the next write counter value.
  * <p>
- * The negatives of this algorithm is that it uses a boxed instance of the write index to
- * track if the slot is free. This allows the buffer to be non-blocking, whereas PTL is blocking.
+ * The negatives of this algorithm is that it uses a boxed instance of the write index to track if
+ * the slot is free. This allows the buffer to be non-blocking, whereas PTL is blocking.
  *
  * https://blogs.oracle.com/dave/entry/ptlqueue_a_scalable_bounded_capacity
  *
@@ -39,7 +36,7 @@ final class TicketBuffer<E> extends ReadBuffer<E> {
 
   long readCounter;
 
-  @SuppressWarnings({"unchecked", "rawtypes"})
+  @SuppressWarnings({"rawtypes", "unchecked"})
   TicketBuffer() {
     writeCounter = new AtomicLong();
     buffer = new AtomicReference[BUFFER_SIZE];
@@ -50,9 +47,8 @@ final class TicketBuffer<E> extends ReadBuffer<E> {
 
   @Override
   public int offer(E e) {
-    final long writeCount = writeCounter.get();
-
-    final int index = (int) (writeCount & BUFFER_MASK);
+    long writeCount = writeCounter.get();
+    int index = (int) (writeCount & BUFFER_MASK);
     AtomicReference<Object> slot = buffer[index];
     Object value = slot.get();
     if (!(value instanceof Turn)) {
@@ -74,8 +70,8 @@ final class TicketBuffer<E> extends ReadBuffer<E> {
   @Override
   public void drainTo(Consumer<E> consumer) {
     for (int i = 0; i < BUFFER_SIZE; i++) {
-      final int index = (int) (readCounter & BUFFER_MASK);
-      final AtomicReference<Object> slot = buffer[index];
+      int index = (int) (readCounter & BUFFER_MASK);
+      AtomicReference<Object> slot = buffer[index];
       if (slot.get() instanceof Turn) {
         break;
       }
@@ -86,13 +82,13 @@ final class TicketBuffer<E> extends ReadBuffer<E> {
   }
 
   @Override
-  public int reads() {
-    return (int) readCounter;
+  public long reads() {
+    return readCounter;
   }
 
   @Override
-  public int writes() {
-    return writeCounter.intValue();
+  public long writes() {
+    return writeCounter.get();
   }
 
   static final class Turn {

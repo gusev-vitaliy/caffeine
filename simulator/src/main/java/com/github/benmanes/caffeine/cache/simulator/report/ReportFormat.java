@@ -17,8 +17,12 @@ package com.github.benmanes.caffeine.cache.simulator.report;
 
 import static java.util.Objects.requireNonNull;
 
-import java.util.function.Function;
+import java.util.Set;
+import java.util.function.BiFunction;
 
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.Characteristic;
+import com.github.benmanes.caffeine.cache.simulator.report.csv.CsvReporter;
+import com.github.benmanes.caffeine.cache.simulator.report.table.TableReporter;
 import com.typesafe.config.Config;
 
 /**
@@ -26,17 +30,18 @@ import com.typesafe.config.Config;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@SuppressWarnings("ImmutableEnumChecker")
 public enum ReportFormat {
   TABLE(TableReporter::new),
   CSV(CsvReporter::new);
 
-  private final Function<Config, Reporter> factory;
+  private final BiFunction<Config, Set<Characteristic>, Reporter> factory;
 
-  private ReportFormat(Function<Config, Reporter> factory) {
+  ReportFormat(BiFunction<Config, Set<Characteristic>, Reporter> factory) {
     this.factory = requireNonNull(factory);
   }
 
-  public Reporter create(Config config) {
-    return factory.apply(config);
+  public Reporter create(Config config, Set<Characteristic> characteristics) {
+    return factory.apply(config, characteristics);
   }
 }

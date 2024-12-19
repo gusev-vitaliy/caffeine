@@ -15,22 +15,23 @@
  */
 package com.github.benmanes.caffeine.cache;
 
+import static java.util.Locale.US;
 import static java.util.Objects.requireNonNull;
 
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.SoftReference;
 import java.lang.ref.WeakReference;
+import java.util.Objects;
 
-import javax.annotation.CheckForNull;
-import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Static utility methods and classes pertaining to weak and soft references.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-@SuppressWarnings("PMD.MissingStaticMethodInNonInstantiatableClass")
+@SuppressWarnings({"EqualsWhichDoesntCheckParameterClass",
+    "PMD.MissingStaticMethodInNonInstantiatableClass"})
 final class References {
 
   private References() {}
@@ -45,21 +46,20 @@ final class References {
      * @return The object to which this reference refers, or {@code null} if this reference object
      *         has been cleared
      */
-    @CheckForNull
+    @Nullable
     E get();
 
     /**
      * Returns the key that is associated to the cache entry holding this reference. If the cache
-     * holds keys strongly, this is that key instance. Otherwise the cache holds keys weakly and the
-     * {@link WeakKeyReference} is returned.
+     * holds keys strongly, this is that key instance. Otherwise, the cache holds keys weakly and
+     * the {@link WeakKeyReference} is returned.
      *
      * @return the key that is associated to the cached entry
      */
-    @Nonnull
     Object getKeyReference();
 
     /**
-     * Returns {@code true} if the arguments is an {@linkplain InternalReference} that holds the
+     * Returns {@code true} if the arguments is a {@linkplain InternalReference} that holds the
      * same element. A weakly or softly held element is compared using identity equality.
      *
      * @param object the reference object with which to compare
@@ -69,8 +69,26 @@ final class References {
       if (object == this) {
         return true;
       } else if (object instanceof InternalReference<?>) {
-        InternalReference<?> referent = (InternalReference<?>) object;
+        var referent = (InternalReference<?>) object;
         return (get() == referent.get());
+      }
+      return false;
+    }
+
+    /**
+     * Returns {@code true} if the arguments is a {@linkplain InternalReference} that holds an
+     * equivalent element as determined by {@link Object#equals}.
+     *
+     * @param object the reference object with which to compare
+     * @return {@code true} if this object is equivalent by {@link Object#equals} as the argument;
+     *         {@code false} otherwise
+     */
+    default boolean objectEquals(@Nullable Object object) {
+      if (object == this) {
+        return true;
+      } else if (object instanceof InternalReference<?>) {
+        var referent = (InternalReference<?>) object;
+        return Objects.equals(get(), referent.get());
       }
       return false;
     }
@@ -81,16 +99,18 @@ final class References {
    * This {@linkplain InternalReference} implementation is not suitable for storing in the cache as
    * the key is strongly held.
    */
-  static final class LookupKeyReference<E> implements InternalReference<E> {
-    private final E e;
+  static final class LookupKeyReference<K> implements InternalReference<K> {
+    private final int hashCode;
+    private final K key;
 
-    public LookupKeyReference(@Nonnull E e) {
-      this.e = requireNonNull(e);
+    public LookupKeyReference(K key) {
+      this.hashCode = System.identityHashCode(key);
+      this.key = requireNonNull(key);
     }
 
     @Override
-    public E get() {
-      return e;
+    public K get() {
+      return key;
     }
 
     @Override
@@ -99,13 +119,60 @@ final class References {
     }
 
     @Override
-    public boolean equals(Object object) {
+    public boolean equals(@Nullable Object object) {
       return referenceEquals(object);
     }
 
     @Override
     public int hashCode() {
-      return System.identityHashCode(e);
+      return hashCode;
+    }
+
+    @Override
+    public String toString() {
+      return String.format(US,
+          "%s{key=%s, hashCode=%d}", getClass().getSimpleName(), get(), hashCode);
+    }
+  }
+
+  /**
+   * A short-lived adapter used for looking up an entry in the cache where the keys are weakly held.
+   * This {@linkplain InternalReference} implementation is not suitable for storing in the cache as
+   * the key is strongly held.
+   */
+  static final class LookupKeyEqualsReference<K> implements InternalReference<K> {
+    private final int hashCode;
+    private final K key;
+
+    public LookupKeyEqualsReference(K key) {
+      this.hashCode = key.hashCode();
+      this.key = requireNonNull(key);
+    }
+
+    @Override
+    public K get() {
+      return key;
+    }
+
+    @Override
+    public Object getKeyReference() {
+      return this;
+    }
+
+    @Override
+    public boolean equals(@Nullable Object object) {
+      return objectEquals(object);
+    }
+
+    @Override
+    public int hashCode() {
+      return hashCode;
+    }
+
+    @Override
+    public String toString() {
+      return String.format(US,
+          "%s{key=%s, hashCode=%d}", getClass().getSimpleName(), get(), hashCode);
     }
   }
 
@@ -123,18 +190,60 @@ final class References {
     }
 
     @Override
+    public final Object getKeyReference() {
+      return this;
+    }
+
+    @Override
+    public final boolean equals(@Nullable Object object) {
+      return referenceEquals(object);
+    }
+
+    @Override
+    public final int hashCode() {
+      return hashCode;
+    }
+
+    @Override
+    public final String toString() {
+      return String.format(US,
+          "%s{key=%s, hashCode=%d}", getClass().getSimpleName(), get(), hashCode);
+    }
+  }
+
+  /**
+   * The key in a cache that holds the key weakly and uses equals equivalence. This class retains
+   * the key's hash code in the advent that the key is reclaimed so that the entry can be removed
+   * from the cache in constant time.
+   */
+  static final class WeakKeyEqualsReference<K>
+      extends WeakReference<K> implements InternalReference<K> {
+    private final int hashCode;
+
+    public WeakKeyEqualsReference(K key, @Nullable ReferenceQueue<K> queue) {
+      super(key, queue);
+      hashCode = key.hashCode();
+    }
+
+    @Override
     public Object getKeyReference() {
       return this;
     }
 
     @Override
-    public boolean equals(Object object) {
-      return referenceEquals(object);
+    public boolean equals(@Nullable Object object) {
+      return objectEquals(object);
     }
 
     @Override
     public int hashCode() {
       return hashCode;
+    }
+
+    @Override
+    public String toString() {
+      return String.format(US,
+          "%s{key=%s, hashCode=%d}", getClass().getSimpleName(), get(), hashCode);
     }
   }
 
@@ -145,9 +254,9 @@ final class References {
    */
   static final class WeakValueReference<V> extends WeakReference<V>
       implements InternalReference<V> {
-    private final Object keyReference;
+    private Object keyReference;
 
-    public WeakValueReference(@Nonnull Object keyReference,
+    public WeakValueReference(Object keyReference,
         @Nullable V value, @Nullable ReferenceQueue<V> queue) {
       super(value, queue);
       this.keyReference = keyReference;
@@ -158,15 +267,24 @@ final class References {
       return keyReference;
     }
 
+    public void setKeyReference(Object keyReference) {
+      this.keyReference = keyReference;
+    }
+
     @Override
-    public boolean equals(Object object) {
+    public boolean equals(@Nullable Object object) {
       return referenceEquals(object);
     }
 
     @Override
-    @SuppressWarnings("PMD.UselessOverridingMethod")
     public int hashCode() {
-      return super.hashCode();
+      V value = get();
+      return (value == null) ? 0 : value.hashCode();
+    }
+
+    @Override
+    public String toString() {
+      return String.format(US, "%s{value=%s}", getClass().getSimpleName(), get());
     }
   }
 
@@ -177,9 +295,9 @@ final class References {
    */
   static final class SoftValueReference<V> extends SoftReference<V>
       implements InternalReference<V> {
-    private final Object keyReference;
+    private Object keyReference;
 
-    public SoftValueReference(@Nonnull Object keyReference,
+    public SoftValueReference(Object keyReference,
         @Nullable V value, @Nullable ReferenceQueue<V> queue) {
       super(value, queue);
       this.keyReference = keyReference;
@@ -190,15 +308,24 @@ final class References {
       return keyReference;
     }
 
+    public void setKeyReference(Object keyReference) {
+      this.keyReference = keyReference;
+    }
+
     @Override
-    public boolean equals(Object object) {
+    public boolean equals(@Nullable Object object) {
       return referenceEquals(object);
     }
 
     @Override
-    @SuppressWarnings("PMD.UselessOverridingMethod")
     public int hashCode() {
-      return super.hashCode();
+      V value = get();
+      return (value == null) ? 0 : value.hashCode();
+    }
+
+    @Override
+    public String toString() {
+      return String.format(US, "%s{value=%s}", getClass().getSimpleName(), get());
     }
   }
 }

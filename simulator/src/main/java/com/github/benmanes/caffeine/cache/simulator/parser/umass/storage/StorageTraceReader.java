@@ -15,11 +15,11 @@
  */
 package com.github.benmanes.caffeine.cache.simulator.parser.umass.storage;
 
-import java.io.IOException;
 import java.math.RoundingMode;
 import java.util.stream.LongStream;
 
 import com.github.benmanes.caffeine.cache.simulator.parser.TextTraceReader;
+import com.github.benmanes.caffeine.cache.simulator.parser.TraceReader.KeyOnlyTraceReader;
 import com.google.common.math.IntMath;
 
 /**
@@ -28,7 +28,7 @@ import com.google.common.math.IntMath;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class StorageTraceReader extends TextTraceReader {
+public final class StorageTraceReader extends TextTraceReader implements KeyOnlyTraceReader {
   static final int BLOCK_SIZE = 512;
 
   public StorageTraceReader(String filePath) {
@@ -36,7 +36,7 @@ public final class StorageTraceReader extends TextTraceReader {
   }
 
   @Override
-  public LongStream events() throws IOException {
+  public LongStream keys() {
     return lines().flatMapToLong(line -> {
       String[] array = line.split(",", 5);
       if (array.length <= 4) {

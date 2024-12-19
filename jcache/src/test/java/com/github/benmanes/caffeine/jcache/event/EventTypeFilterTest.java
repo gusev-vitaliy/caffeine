@@ -15,44 +15,45 @@
  */
 package com.github.benmanes.caffeine.jcache.event;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.not;
+import static com.google.common.truth.Truth.assertThat;
 
-import javax.cache.event.CacheEntryEventFilter;
-import javax.cache.event.CacheEntryListener;
+import javax.cache.event.CacheEntryCreatedListener;
 
-import org.mockito.Mockito;
+import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
 /**
  * @author ben.manes@gmail.com (Ben Manes)
  */
-@SuppressWarnings("unchecked")
 public final class EventTypeFilterTest {
-  EventTypeFilter<Integer, Integer> filter = new EventTypeFilter<>(
-      Mockito.mock(CacheEntryListener.class), Mockito.mock(CacheEntryEventFilter.class));
+  EventTypeFilter<Integer, Integer> filter;
+
+  @BeforeClass
+  public void before() {
+    CacheEntryCreatedListener<Integer, Integer> created = events -> {};
+    filter = new EventTypeFilter<>(created, event -> true);
+  }
 
   @Test
+  @SuppressWarnings("TruthIncompatibleType")
   public void equals_wrongType() {
-    assertThat(filter, is(not(1)));
+    assertThat(filter).isNotEqualTo(1);
   }
 
   @Test
   public void equals_false() {
-    EventTypeFilter<Integer, Integer> other = new EventTypeFilter<>(
-        Mockito.mock(CacheEntryListener.class), Mockito.mock(CacheEntryEventFilter.class));
-    assertThat(filter, is(not(equalTo(other))));
+    CacheEntryCreatedListener<Integer, Integer> created = events -> {};
+    var other = new EventTypeFilter<>(created, event -> false);
+    assertThat(filter).isNotEqualTo(other);
   }
 
   @Test
   public void equals() {
-    assertThat(filter, is(equalTo(filter)));
+    assertThat(filter.equals(filter)).isTrue();
   }
 
   @Test
   public void hash() {
-    filter.hashCode();
+    assertThat(filter.hashCode()).isEqualTo(filter.hashCode());
   }
 }

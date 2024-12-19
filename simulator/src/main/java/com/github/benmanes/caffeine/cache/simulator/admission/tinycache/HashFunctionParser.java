@@ -15,34 +15,37 @@
  */
 package com.github.benmanes.caffeine.cache.simulator.admission.tinycache;
 
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import com.google.errorprone.annotations.Var;
+
 /**
  * This is a hash function and parser tp simplify parsing the hash value, it split it to . This
  * class provide hash utilities, and parse the items.
  *
  * @author gilga1983@gmail.com (Gil Einziger)
  */
-public final class HashFunctionParser {
-  // currently chain is bounded to be 64.
+@SuppressWarnings("MemberName")
+final class HashFunctionParser {
+  // currently, chain is bounded to be 64.
   private static final int fpSize = 8; // this implementation assumes byte.
   private static final byte fpMask = (byte) 255; // (all bits in byte are 1, (logical value of -1));
   private static final long chainMask = 63L; // (6 first bit are set to 1).
-  private final int nrSets;
-  public HashedItem fpaux; // used just to avoid allocating new memory as a return value.
-  private final static long Seed64 = 0xe17a1465;
-  private final static long m = 0xc6a4a7935bd1e995L;
-  private final static int r = 47;
+  private static final long m = 0xc6a4a7935bd1e995L;
+  private static final long Seed64 = 0xe17a1465L;
+  private static final int r = 47;
 
-  public HashFunctionParser(int nrsets) {
-    this.nrSets = nrsets;
+  final HashedItem fpaux; // used just to avoid allocating new memory as a return value.
+
+  private final int nrSets;
+
+  public HashFunctionParser(int nrSets) {
+    this.nrSets = nrSets;
     fpaux = new HashedItem(fpMask, fpMask, fpMask, 0L);
   }
 
-  public HashedItem createHash(Object item) {
-    return createHash(item.hashCode());
-  }
-
-  public HashedItem createHash(long item) {
-    long h = (Seed64) ^ (m);
+  @CanIgnoreReturnValue
+  public HashedItem createHash(@Var long item) {
+    @Var long h = (Seed64 ^ m);
     item *= m;
     item ^= item >>> r;
     item *= m;
@@ -50,7 +53,7 @@ public final class HashFunctionParser {
     h ^= item;
     h *= m;
 
-    fpaux.fingerprint = (byte) (h & fpMask);
+    fpaux.fingerprint = (byte) h;
     // the next line is a dirty fix as I do not want the value of 0 as a fingerprint.
     // It can be eliminated if we want very short fingerprints.
     fpaux.fingerprint = (fpaux.fingerprint == 0L) ? 1 : fpaux.fingerprint;

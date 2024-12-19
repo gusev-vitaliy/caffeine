@@ -17,13 +17,12 @@ package com.github.benmanes.caffeine.cache.buffer;
 
 import java.util.function.Supplier;
 
-import com.github.benmanes.caffeine.cache.ReadBuffer;
-
 /**
  * The different read buffer strategies.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@SuppressWarnings({"ImmutableEnumChecker", "MemberName"})
 public enum BufferType {
   Ticket(TicketBuffer::new),
   FastFlow(FastFlowBuffer::new),
@@ -35,7 +34,7 @@ public enum BufferType {
 
   private final Supplier<ReadBuffer<Boolean>> factory;
 
-  private BufferType(Supplier<ReadBuffer<Boolean>> factory) {
+  BufferType(Supplier<ReadBuffer<Boolean>> factory) {
     this.factory = factory;
   }
 

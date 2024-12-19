@@ -15,16 +15,15 @@
  */
 package com.github.benmanes.caffeine.jcache.copy;
 
-import javax.annotation.Nonnull;
-import javax.annotation.concurrent.ThreadSafe;
+import org.jspecify.annotations.NullMarked;
 
 /**
- * An object is copied when the cache is configured with <tt>storeByValue</tt> to guard against
+ * An object is copied when the cache is configured with <code>storeByValue</code> to guard against
  * mutations of the key or value.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-@ThreadSafe
+@NullMarked
 @FunctionalInterface
 public interface Copier {
 
@@ -36,10 +35,9 @@ public interface Copier {
    * @param <T> the type of object being copied
    * @return a copy of the object
    */
-  @Nonnull
-  <T> T copy(@Nonnull T object, @Nonnull ClassLoader classLoader);
+  <T> T copy(T object, ClassLoader classLoader);
 
-  /** @return a copy strategy that performs an identity function, for use by store-by-reference */
+  /** Return a copy strategy that performs an identity function, for use by store-by-reference. */
   static Copier identity() {
     return IdentityCopier.INSTANCE;
   }
@@ -49,7 +47,7 @@ enum IdentityCopier implements Copier {
   INSTANCE;
 
   @Override
-  public <T> T copy(@Nonnull T object, @Nonnull ClassLoader classLoader) {
+  public <T> T copy(T object, ClassLoader classLoader) {
     return object;
   }
 }

@@ -15,13 +15,21 @@
  */
 package com.github.benmanes.caffeine.cache;
 
+import static com.github.benmanes.caffeine.cache.Caffeine.calculateHashMapCapacity;
+import static java.util.Objects.requireNonNull;
+
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Function;
 
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
+import com.google.errorprone.annotations.Var;
 
 /**
  * This class provides a skeletal implementation of the {@link Cache} interface to minimize the
@@ -29,10 +37,10 @@ import com.github.benmanes.caffeine.cache.stats.CacheStats;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-interface LocalManualCache<C extends LocalCache<K, V>, K, V> extends Cache<K, V> {
+interface LocalManualCache<K, V> extends Cache<K, V> {
 
   /** Returns the backing {@link LocalCache} data store. */
-  C cache();
+  LocalCache<K, V> cache();
 
   @Override
   default long estimatedSize() {
@@ -45,18 +53,73 @@ interface LocalManualCache<C extends LocalCache<K, V>, K, V> extends Cache<K, V>
   }
 
   @Override
-  default @Nullable V getIfPresent(Object key) {
-    return cache().getIfPresent(key, true);
+  default @Nullable V getIfPresent(K key) {
+    return cache().getIfPresent(key, /* recordStats= */ true);
   }
 
   @Override
-  default V get(K key, Function<? super K, ? extends V> mappingFunction) {
+  @SuppressWarnings("NullAway")
+  default @Nullable V get(K key, Function<? super K, ? extends V> mappingFunction) {
     return cache().computeIfAbsent(key, mappingFunction);
   }
 
   @Override
-  default Map<K, V> getAllPresent(Iterable<?> keys) {
+  default Map<K, V> getAllPresent(Iterable<? extends K> keys) {
     return cache().getAllPresent(keys);
+  }
+
+  @Override
+  default Map<K, V> getAll(Iterable<? extends K> keys,
+      Function<? super Set<? extends K>, ? extends Map<? extends K, ? extends V>> mappingFunction) {
+    requireNonNull(mappingFunction);
+
+    var found = cache().getAllPresent(keys);
+    int initialCapacity = calculateHashMapCapacity(keys);
+    var result = new LinkedHashMap<K, V>(initialCapacity);
+    var keysToLoad = new LinkedHashSet<K>(initialCapacity);
+    for (K key : keys) {
+      V value = found.get(key);
+      if (value == null) {
+        keysToLoad.add(key);
+      }
+      result.put(key, value);
+    }
+    if (keysToLoad.isEmpty()) {
+      return found;
+    }
+
+    bulkLoad(keysToLoad, result, mappingFunction);
+    return Collections.unmodifiableMap(result);
+  }
+
+  /**
+   * Performs a non-blocking bulk load of the missing keys. Any missing entry that materializes
+   * during the load are replaced when the loaded entries are inserted into the cache.
+   */
+  default void bulkLoad(Set<K> keysToLoad, Map<K, V> result,
+      Function<? super Set<? extends K>, ? extends Map<? extends K, ? extends V>> mappingFunction) {
+    long startTime = cache().statsTicker().read();
+    @Var boolean success = false;
+    try {
+      var loaded = mappingFunction.apply(Collections.unmodifiableSet(keysToLoad));
+      loaded.forEach(cache()::put);
+      for (K key : keysToLoad) {
+        V value = loaded.get(key);
+        if (value == null) {
+          result.remove(key);
+        } else {
+          result.put(key, value);
+        }
+      }
+      success = !loaded.isEmpty();
+    } finally {
+      long loadTime = cache().statsTicker().read() - startTime;
+      if (success) {
+        cache().statsCounter().recordLoadSuccess(loadTime);
+      } else {
+        cache().statsCounter().recordLoadFailure(loadTime);
+      }
+    }
   }
 
   @Override
@@ -70,12 +133,12 @@ interface LocalManualCache<C extends LocalCache<K, V>, K, V> extends Cache<K, V>
   }
 
   @Override
-  default void invalidate(Object key) {
+  default void invalidate(K key) {
     cache().remove(key);
   }
 
   @Override
-  default void invalidateAll(Iterable<?> keys) {
+  default void invalidateAll(Iterable<? extends K> keys) {
     cache().invalidateAll(keys);
   }
 

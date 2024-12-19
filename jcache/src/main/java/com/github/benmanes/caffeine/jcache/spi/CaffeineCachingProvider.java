@@ -15,36 +15,54 @@
  */
 package com.github.benmanes.caffeine.jcache.spi;
 
+import static javax.cache.configuration.OptionalFeature.STORE_BY_REFERENCE;
+
+import java.io.IOException;
 import java.net.URI;
+import java.net.URL;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
 import java.util.WeakHashMap;
 
-import javax.annotation.concurrent.GuardedBy;
 import javax.cache.CacheManager;
 import javax.cache.Caching;
 import javax.cache.configuration.OptionalFeature;
 import javax.cache.spi.CachingProvider;
 
+import org.jspecify.annotations.NullMarked;
+import org.jspecify.annotations.Nullable;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+
 import com.github.benmanes.caffeine.jcache.CacheManagerImpl;
+import com.google.errorprone.annotations.Var;
+import com.google.errorprone.annotations.concurrent.GuardedBy;
 
 /**
- * A provider that produces a JCache implementation backed by Caffeine. Typically this provider is
- * instantiated using {@link Caching#getCachingProvider()}, which discovers this implementation
+ * A provider that produces a JCache implementation backed by Caffeine. Typically, this provider is
+ * instantiated using {@link Caching#getCachingProvider()} which discovers this implementation
  * through a {@link java.util.ServiceLoader}.
  * <p>
  * This provider is expected to be used for application life cycle events, like initialization. It
- * is not expected that all requests flow through the provider in obtain the cache manager and cache
- * instances for frequest operations. Internally, this implementation is synchronized to avoid using
+ * is not expected that all requests flow through the provider to obtain the cache manager and cache
+ * instances for request operations. Internally, this implementation is synchronized to avoid using
  * excess memory due to its infrequent usage.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@Component
+@NullMarked
 public final class CaffeineCachingProvider implements CachingProvider {
+  private static final ClassLoader DEFAULT_CLASS_LOADER = new JCacheClassLoader();
+
   @GuardedBy("itself")
-  private final Map<ClassLoader, Map<URI, CacheManager>> cacheManagers;
+  final Map<ClassLoader, Map<URI, CacheManager>> cacheManagers;
+
+  boolean isOsgiComponent;
 
   public CaffeineCachingProvider() {
     this.cacheManagers = new WeakHashMap<>(1);
@@ -52,7 +70,7 @@ public final class CaffeineCachingProvider implements CachingProvider {
 
   @Override
   public ClassLoader getDefaultClassLoader() {
-    return getClass().getClassLoader();
+    return DEFAULT_CLASS_LOADER;
   }
 
   @Override
@@ -62,7 +80,7 @@ public final class CaffeineCachingProvider implements CachingProvider {
 
   @Override
   public Properties getDefaultProperties() {
-    return null;
+    return new Properties();
   }
 
   @Override
@@ -77,15 +95,16 @@ public final class CaffeineCachingProvider implements CachingProvider {
 
   @Override
   public CacheManager getCacheManager(URI uri, ClassLoader classLoader, Properties properties) {
-    URI managerURI = getManagerUri(uri);
+    URI managerUri = getManagerUri(uri);
     ClassLoader managerClassLoader = getManagerClassLoader(classLoader);
 
     synchronized (cacheManagers) {
-      Map<URI, CacheManager> cacheManagersByURI = cacheManagers.computeIfAbsent(
+      Map<URI, CacheManager> cacheManagersByUri = cacheManagers.computeIfAbsent(
           managerClassLoader, any -> new HashMap<>());
-      return cacheManagersByURI.computeIfAbsent(managerURI, any -> {
-        Properties managerProperties = (properties == null) ? new Properties() : properties;
-        return new CacheManagerImpl(this, managerURI, managerClassLoader, managerProperties);
+      return cacheManagersByUri.computeIfAbsent(managerUri, any -> {
+        Properties managerProperties = (properties == null) ? getDefaultProperties() : properties;
+        return new CacheManagerImpl(this, isOsgiComponent,
+            managerUri, managerClassLoader, managerProperties);
       });
     }
   }
@@ -100,12 +119,13 @@ public final class CaffeineCachingProvider implements CachingProvider {
   }
 
   @Override
+  @SuppressWarnings("PMD.CloseResource")
   public void close(ClassLoader classLoader) {
     synchronized (cacheManagers) {
       ClassLoader managerClassLoader = getManagerClassLoader(classLoader);
-      Map<URI, CacheManager> cacheManagersByURI = cacheManagers.remove(managerClassLoader);
-      if (cacheManagersByURI != null) {
-        for (CacheManager cacheManager : cacheManagersByURI.values()) {
+      Map<URI, CacheManager> cacheManagersByUri = cacheManagers.remove(managerClassLoader);
+      if (cacheManagersByUri != null) {
+        for (CacheManager cacheManager : cacheManagersByUri.values()) {
           cacheManager.close();
         }
       }
@@ -113,17 +133,18 @@ public final class CaffeineCachingProvider implements CachingProvider {
   }
 
   @Override
+  @SuppressWarnings("PMD.CloseResource")
   public void close(URI uri, ClassLoader classLoader) {
     synchronized (cacheManagers) {
       ClassLoader managerClassLoader = getManagerClassLoader(classLoader);
-      Map<URI, CacheManager> cacheManagersByURI = cacheManagers.get(managerClassLoader);
+      Map<URI, CacheManager> cacheManagersByUri = cacheManagers.get(managerClassLoader);
 
-      if (cacheManagersByURI != null) {
-        CacheManager cacheManager = cacheManagersByURI.remove(getManagerUri(uri));
+      if (cacheManagersByUri != null) {
+        CacheManager cacheManager = cacheManagersByUri.remove(getManagerUri(uri));
         if (cacheManager != null) {
           cacheManager.close();
         }
-        if (cacheManagersByURI.isEmpty()) {
+        if (cacheManagersByUri.isEmpty()) {
           cacheManagers.remove(managerClassLoader);
         }
       }
@@ -131,14 +152,8 @@ public final class CaffeineCachingProvider implements CachingProvider {
   }
 
   @Override
-  @SuppressWarnings("PMD.TooFewBranchesForASwitchStatement")
   public boolean isSupported(OptionalFeature optionalFeature) {
-    switch (optionalFeature) {
-      case STORE_BY_REFERENCE:
-        return true;
-      default:
-        return false;
-    }
+    return (optionalFeature == STORE_BY_REFERENCE);
   }
 
   private URI getManagerUri(URI uri) {
@@ -147,5 +162,112 @@ public final class CaffeineCachingProvider implements CachingProvider {
 
   private ClassLoader getManagerClassLoader(ClassLoader classLoader) {
     return (classLoader == null) ? getDefaultClassLoader() : classLoader;
+  }
+
+  /**
+   * A {@link ClassLoader} that combines {@code Thread.currentThread().getContextClassLoader()}
+   * and {@code getClass().getClassLoader()}.
+   */
+  private static final class JCacheClassLoader extends ClassLoader {
+
+    public JCacheClassLoader() {
+      super(Thread.currentThread().getContextClassLoader());
+    }
+
+    @Override
+    public Class<?> loadClass(String name) throws ClassNotFoundException {
+      @Var ClassNotFoundException error = null;
+
+      ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
+      if ((contextClassLoader != null) && (contextClassLoader != DEFAULT_CLASS_LOADER)) {
+        try {
+          return contextClassLoader.loadClass(name);
+        } catch (ClassNotFoundException e) {
+          error = e;
+        }
+      }
+
+      ClassLoader classClassLoader = getClass().getClassLoader();
+      if ((classClassLoader != null) && (classClassLoader != contextClassLoader)) {
+        try {
+          return classClassLoader.loadClass(name);
+        } catch (ClassNotFoundException e) {
+          error = e;
+        }
+      }
+
+      ClassLoader parentClassLoader = getParent();
+      if ((parentClassLoader != null)
+          && (parentClassLoader != classClassLoader)
+          && (parentClassLoader != contextClassLoader)) {
+        try {
+          return parentClassLoader.loadClass(name);
+        } catch (ClassNotFoundException e) {
+          error = e;
+        }
+      }
+      throw (error == null) ? new ClassNotFoundException(name) : error;
+    }
+
+    @Override
+    public @Nullable URL getResource(String name) {
+      ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
+      if ((contextClassLoader != null) && (contextClassLoader != DEFAULT_CLASS_LOADER)) {
+        URL resource = contextClassLoader.getResource(name);
+        if (resource != null) {
+          return resource;
+        }
+      }
+
+      ClassLoader classClassLoader = getClass().getClassLoader();
+      if ((classClassLoader != null) && (classClassLoader != contextClassLoader)) {
+        URL resource = classClassLoader.getResource(name);
+        if (resource != null) {
+          return resource;
+        }
+      }
+
+      ClassLoader parentClassLoader = getParent();
+      if ((parentClassLoader != null)
+          && (parentClassLoader != classClassLoader)
+          && (parentClassLoader != contextClassLoader)) {
+        URL resource = parentClassLoader.getResource(name);
+        if (resource != null) {
+          return resource;
+        }
+      }
+
+      return null;
+    }
+
+    @Override
+    public Enumeration<URL> getResources(String name) throws IOException {
+      var resources = new ArrayList<URL>();
+
+      ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
+      if (contextClassLoader != null && contextClassLoader != DEFAULT_CLASS_LOADER) {
+        resources.addAll(Collections.list(contextClassLoader.getResources(name)));
+      }
+
+      ClassLoader classClassLoader = getClass().getClassLoader();
+      if ((classClassLoader != null) && (classClassLoader != contextClassLoader)) {
+        resources.addAll(Collections.list(classClassLoader.getResources(name)));
+      }
+
+      ClassLoader parentClassLoader = getParent();
+      if ((parentClassLoader != null)
+          && (parentClassLoader != classClassLoader)
+          && (parentClassLoader != contextClassLoader)) {
+        resources.addAll(Collections.list(parentClassLoader.getResources(name)));
+      }
+
+      return Collections.enumeration(resources);
+    }
+  }
+
+  @Activate
+  @SuppressWarnings("unused")
+  private void activate() {
+    isOsgiComponent = true;
   }
 }

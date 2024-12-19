@@ -18,7 +18,7 @@ package com.github.benmanes.caffeine.cache.impl;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-import javax.annotation.concurrent.NotThreadSafe;
+import org.jspecify.annotations.Nullable;
 
 import com.github.benmanes.caffeine.cache.BasicCache;
 
@@ -28,12 +28,12 @@ import com.github.benmanes.caffeine.cache.BasicCache;
 public final class LinkedHashMapCache<K, V> implements BasicCache<K, V> {
   private final Map<K, V> map;
 
-  public LinkedHashMapCache(boolean accessOrder, int maximumSize) {
-    map = new BoundedLinkedHashMap<>(accessOrder, maximumSize);
+  public LinkedHashMapCache(int maximumSize, boolean accessOrder) {
+    map = new BoundedLinkedHashMap<>(maximumSize, accessOrder);
   }
 
   @Override
-  public V get(K key) {
+  public @Nullable V get(K key) {
     synchronized (map) {
       return map.get(key);
     }
@@ -46,12 +46,25 @@ public final class LinkedHashMapCache<K, V> implements BasicCache<K, V> {
     }
   }
 
-  @NotThreadSafe
+  @Override
+  public void remove(K key) {
+    synchronized (map) {
+      map.remove(key);
+    }
+  }
+
+  @Override
+  public void clear() {
+    synchronized (map) {
+      map.clear();
+    }
+  }
+
   static final class BoundedLinkedHashMap<K, V> extends LinkedHashMap<K, V> {
     private static final long serialVersionUID = 1L;
     private final int maximumSize;
 
-    public BoundedLinkedHashMap(boolean accessOrder, int maximumSize) {
+    public BoundedLinkedHashMap(int maximumSize, boolean accessOrder) {
       super(maximumSize, 0.75f, accessOrder);
       this.maximumSize = maximumSize;
     }

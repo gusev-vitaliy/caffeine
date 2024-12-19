@@ -15,56 +15,42 @@
  */
 package com.github.benmanes.caffeine.cache;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.is;
-
-import java.util.Optional;
+import static com.google.common.truth.Truth.assertThat;
+import static org.slf4j.event.Level.TRACE;
 
 import org.testng.annotations.Listeners;
 import org.testng.annotations.Test;
 
+import com.github.benmanes.caffeine.cache.testing.CacheContext;
 import com.github.benmanes.caffeine.cache.testing.CacheProvider;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec.CacheWeigher;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec.Expire;
-import com.github.benmanes.caffeine.cache.testing.CacheSpec.Implementation;
-import com.github.benmanes.caffeine.cache.testing.CacheSpec.MaximumSize;
+import com.github.benmanes.caffeine.cache.testing.CacheSpec.Maximum;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec.Population;
 import com.github.benmanes.caffeine.cache.testing.CacheSpec.ReferenceType;
 import com.github.benmanes.caffeine.cache.testing.CacheValidationListener;
+import com.github.benmanes.caffeine.cache.testing.CheckMaxLogLevel;
 
 /**
  * The test cases for the implementation details of {@link UnboundedLocalCache}.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
+@CheckMaxLogLevel(TRACE)
 @Listeners(CacheValidationListener.class)
 @Test(dataProviderClass = CacheProvider.class)
 public final class UnboundedLocalCacheTest {
 
-  @CacheSpec(implementation = Implementation.Caffeine, population = Population.EMPTY,
-      maximumSize = MaximumSize.DISABLED, weigher = CacheWeigher.DEFAULT,
+  @CacheSpec(population = Population.EMPTY, refreshAfterWrite = Expire.DISABLED,
       expireAfterAccess = Expire.DISABLED, expireAfterWrite = Expire.DISABLED,
-      refreshAfterWrite = Expire.DISABLED, keys = ReferenceType.STRONG,
-      values = ReferenceType.STRONG)
+      maximumSize = Maximum.DISABLED, weigher = CacheWeigher.DISABLED,
+      keys = ReferenceType.STRONG, values = ReferenceType.STRONG)
   @Test(dataProvider = "caches")
-  public void noPolicy(Cache<Integer, Integer> cache) {
-    assertThat(cache.policy().eviction(), is(Optional.empty()));
-    assertThat(cache.policy().expireAfterWrite(), is(Optional.empty()));
-    assertThat(cache.policy().expireAfterAccess(), is(Optional.empty()));
-    assertThat(cache.policy().refreshAfterWrite(), is(Optional.empty()));
-  }
-
-  @CacheSpec(implementation = Implementation.Caffeine, population = Population.EMPTY,
-      maximumSize = MaximumSize.DISABLED, weigher = CacheWeigher.DEFAULT,
-      expireAfterAccess = Expire.DISABLED, expireAfterWrite = Expire.DISABLED,
-      refreshAfterWrite = Expire.DISABLED, keys = ReferenceType.STRONG,
-      values = ReferenceType.STRONG)
-  @Test(dataProvider = "caches")
-  public void noPolicy_async(AsyncLoadingCache<Integer, Integer> cache) {
-    assertThat(cache.synchronous().policy().eviction(), is(Optional.empty()));
-    assertThat(cache.synchronous().policy().expireAfterWrite(), is(Optional.empty()));
-    assertThat(cache.synchronous().policy().expireAfterAccess(), is(Optional.empty()));
-    assertThat(cache.synchronous().policy().refreshAfterWrite(), is(Optional.empty()));
+  public void noPolicy(Cache<Integer, Integer> cache, CacheContext context) {
+    assertThat(cache.policy().eviction()).isEmpty();
+    assertThat(cache.policy().expireAfterWrite()).isEmpty();
+    assertThat(cache.policy().expireAfterAccess()).isEmpty();
+    assertThat(cache.policy().refreshAfterWrite()).isEmpty();
   }
 }

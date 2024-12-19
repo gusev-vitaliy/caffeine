@@ -19,13 +19,10 @@ import static com.github.benmanes.caffeine.cache.Specifications.DEAD_STRONG_KEY;
 import static com.github.benmanes.caffeine.cache.Specifications.DEAD_WEAK_KEY;
 import static com.github.benmanes.caffeine.cache.Specifications.RETIRED_STRONG_KEY;
 import static com.github.benmanes.caffeine.cache.Specifications.RETIRED_WEAK_KEY;
-import static com.github.benmanes.caffeine.cache.Specifications.UNSAFE_ACCESS;
-import static com.github.benmanes.caffeine.cache.Specifications.offsetName;
+import static com.github.benmanes.caffeine.cache.Specifications.referenceType;
+import static com.github.benmanes.caffeine.cache.node.NodeContext.varHandleName;
 
-import java.lang.ref.Reference;
-
-import javax.lang.model.element.Modifier;
-
+import com.github.benmanes.caffeine.cache.node.NodeContext.Strength;
 import com.squareup.javapoet.MethodSpec;
 
 /**
@@ -33,18 +30,18 @@ import com.squareup.javapoet.MethodSpec;
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class AddHealth extends NodeRule {
+public final class AddHealth implements NodeRule {
 
   @Override
-  protected boolean applies() {
-    return isBaseClass();
+  public boolean applies(NodeContext context) {
+    return context.isBaseClass();
   }
 
   @Override
-  protected void execute() {
+  public void execute(NodeContext context) {
     String retiredArg;
     String deadArg;
-    if (keyStrength() == Strength.STRONG) {
+    if (context.keyStrength() == Strength.STRONG) {
       retiredArg = RETIRED_STRONG_KEY;
       deadArg = DEAD_STRONG_KEY;
     } else {
@@ -55,29 +52,43 @@ public final class AddHealth extends NodeRule {
     context.nodeSubtype.addMethod(MethodSpec.methodBuilder("isAlive")
         .addStatement("Object key = getKeyReference()")
         .addStatement("return (key != $L) && (key != $L)", retiredArg, deadArg)
-        .addModifiers(Modifier.PUBLIC, Modifier.FINAL)
+        .addModifiers(context.publicFinalModifiers())
         .returns(boolean.class)
         .build());
-    addState("isRetired", "retire", retiredArg);
-    addState("isDead", "die", deadArg);
+    addState(context, "isRetired", "retire", retiredArg, /* finalized= */ false);
+    addState(context, "isDead", "die", deadArg, /* finalized= */ true);
   }
 
-  private void addState(String checkName, String actionName, String arg) {
+  private static void addState(NodeContext context, String checkName,
+      String actionName, String arg, boolean finalized) {
     context.nodeSubtype.addMethod(MethodSpec.methodBuilder(checkName)
         .addStatement("return (getKeyReference() == $L)", arg)
-        .addModifiers(Modifier.PUBLIC, Modifier.FINAL)
+        .addModifiers(context.publicFinalModifiers())
         .returns(boolean.class)
         .build());
 
-    MethodSpec.Builder action = MethodSpec.methodBuilder(actionName)
-        .addModifiers(Modifier.PUBLIC, Modifier.FINAL);
-    if (keyStrength() != Strength.STRONG) {
-      action.addStatement("(($T<K>) getKeyReference()).clear()", Reference.class);
+    var action = MethodSpec.methodBuilder(actionName)
+        .addModifiers(context.publicFinalModifiers());
+    if (context.valueStrength() == Strength.STRONG) {
+      if (context.keyStrength() != Strength.STRONG) {
+        action.addStatement("key.clear()");
+      }
+      // Set the value to null only when dead, as otherwise the explicit removal of an expired async
+      // value will be notified as explicit rather than expired due to the isComputingAsync() check
+      if (finalized) {
+        action.addStatement("$L.set(this, null)", varHandleName("value"));
+      }
+      action.addStatement("$L.set(this, $N)", varHandleName("key"), arg);
+    } else {
+      action.addStatement("$1T valueRef = ($1T) $2L.get(this)",
+          context.valueReferenceType(), varHandleName("value"));
+      if (context.keyStrength() != Strength.STRONG) {
+        action.addStatement("$1T keyRef = ($1T) valueRef.getKeyReference()", referenceType);
+        action.addStatement("keyRef.clear()");
+      }
+      action.addStatement("valueRef.setKeyReference($N)", arg);
+      action.addStatement("valueRef.clear()");
     }
-    if (valueStrength() != Strength.STRONG) {
-      action.addStatement("(($T<V>) getValueReference()).clear()", Reference.class);
-    }
-    action.addStatement("$T.UNSAFE.putObject(this, $N, $N)", UNSAFE_ACCESS, offsetName("key"), arg);
     context.nodeSubtype.addMethod(action.build());
   }
 }

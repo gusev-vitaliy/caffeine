@@ -1,0 +1,90 @@
+name: Run Gradle
+description: Sets up Gradle JDKs and runs Gradle
+inputs:
+  arguments:
+    required: false
+    description: Gradle arguments
+  java:
+    required: true
+    description: The JDK version
+  early-access:
+    default: '25'
+    required: false
+    description: The early access release
+  graal:
+    default: '21'
+    required: false
+    description: The GraalVM version
+  cache-encryption-key:
+    required: false
+    description: A Gradle cache encryption key
+  attempt-limit:
+    default: '1'
+    required: false
+    description: Number of attempts
+  attempt-delay:
+    default: '0'
+    required: false
+    description: A delay between attempts in seconds
+runs:
+  using: composite
+  steps:
+    - name: Read Gradle JDK toolchain version
+      shell: bash
+      run: |
+        toolchainVersion=$(grep -oP '(?<=^toolchainVersion=).*' gradle/gradle-daemon-jvm.properties)
+        echo "toolchainVersion=${toolchainVersion}" >> $GITHUB_ENV
+    - name: Set up JDK ${{ env.toolchainVersion }}
+      uses: actions/setup-java@8df1039502a15bceb9433410b1a100fbe190c53b # v4.5.0
+      with:
+        java-version: ${{ env.toolchainVersion }}
+        distribution: temurin
+    - name: Prepare JDK toolchain
+      shell: bash
+      run: |
+        if [[ "${{ inputs.java }}" == "GraalVM" ]]; then
+          echo "JAVA_VENDOR=GraalVM Community" >> $GITHUB_ENV
+          echo "JAVA_VERSION=${{ inputs.graal }}" >> $GITHUB_ENV
+        else
+          echo "JAVA_VENDOR=Adoptium" >> $GITHUB_ENV
+          echo "JAVA_VERSION=${{ inputs.java }}" >> $GITHUB_ENV
+        fi
+    - name: Set up JDK
+      uses: actions/setup-java@8df1039502a15bceb9433410b1a100fbe190c53b # v4.5.0
+      with:
+        java-version: ${{
+          inputs.java == 'GraalVM' && inputs.graal ||
+          (inputs.early-access == inputs.java && format('{0}-ea', inputs.java) || inputs.java) }}
+        distribution: ${{ inputs.java == 'GraalVM' && 'graalvm' || 'temurin' }}
+    - name: Prepare JDK ${{ inputs.java }}
+      shell: bash
+      run: |
+        if [[ "${{ inputs.java }}" == "GraalVM" ]]; then
+          echo "GRAALVM_HOME=$JAVA_HOME" >> $GITHUB_ENV
+        fi
+        echo "JDK_CI=$JAVA_HOME" >> $GITHUB_ENV
+        echo "JDK_EA=${{ inputs.early-access == inputs.java }}" >> $GITHUB_ENV
+        echo "JAVA_TOOL_OPTIONS=-Dorg.gradle.workers.max=$((2 * $(nproc)))" >> $GITHUB_ENV
+        echo "ORG_GRADLE_PROJECT_org.gradle.java.installations.auto-download=false" >> $GITHUB_ENV
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@cc4fc85e6b35bafd578d5ffbc76a5518407e1af0 # v4.2.1
+      with:
+        add-job-summary: never
+        cache-read-only: false
+        gradle-home-cache-strict-match: true
+        cache-encryption-key: ${{ inputs.cache-encryption-key }}
+    - name: Run ${{ inputs.arguments }}
+      if: ${{ inputs.arguments != '' }}
+      shell: bash
+      run: |
+        echo "::add-matcher::.github/problem-matcher.json"
+        for ((i=1; i<=${{ inputs.attempt-limit }}; i++)); do
+          ./gradlew --no-problems-report $(echo "${{ inputs.arguments }}" | tr -d '\n') && break
+          if [ $i -lt ${{ inputs.attempt-limit }} ]; then
+            echo "Attempt $i failed. Retrying in ${{ inputs.attempt-delay }} seconds..."
+            sleep ${{ inputs.attempt-delay }}
+          else
+            echo "All attempts failed."
+            exit 1
+          fi
+        done

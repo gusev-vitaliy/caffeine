@@ -15,15 +15,12 @@
  */
 package com.github.benmanes.caffeine.cache.simulator.policy.two_queue;
 
-import static com.google.common.base.Preconditions.checkState;
-
-import java.util.Set;
-
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
-import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
 import com.google.common.base.MoreObjects;
-import com.google.common.collect.ImmutableSet;
+import com.google.errorprone.annotations.Var;
 import com.typesafe.config.Config;
 
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
@@ -35,47 +32,43 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  * monitored (OUT). The maximum size of the IN and OUT queues must be tuned with the authors
  * recommending 20% and 50% of the maximum size, respectively.
  * <p>
- * This implementation is based on the pseudo code provided by the authors in their paper
+ * This implementation is based on the pseudocode provided by the authors in their paper
  * <a href="http://www.vldb.org/conf/1994/P439.PDF">2Q: A Low Overhead High Performance Buffer
  * Management Replacement Algorithm</a>. For consistency with other policies, this version places
  * the next item to be removed at the head and most recently added at the tail of the queue.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
-public final class TwoQueuePolicy implements Policy {
-  private static final Node UNLINKED = new Node();
+@PolicySpec(name = "two-queue.TwoQueue")
+public final class TwoQueuePolicy implements KeyOnlyPolicy {
+  static final Node UNLINKED = new Node();
 
-  private final Long2ObjectMap<Node> data;
-  private final PolicyStats policyStats;
-  private final int maximumSize;
+  final Long2ObjectMap<Node> data;
+  final PolicyStats policyStats;
+  final int maximumSize;
 
-  private int sizeIn;
-  private final int maxIn;
-  private final Node headIn;
+  int sizeIn;
+  final int maxIn;
+  final Node headIn;
 
-  private int sizeOut;
-  private final int maxOut;
-  private final Node headOut;
+  int sizeOut;
+  final int maxOut;
+  final Node headOut;
 
-  private int sizeMain;
-  private final Node headMain;
+  int sizeMain;
+  final Node headMain;
 
   public TwoQueuePolicy(Config config) {
-    TwoQueueSettings settings = new TwoQueueSettings(config);
+    var settings = new TwoQueueSettings(config);
 
     this.headIn = new Node();
     this.headOut = new Node();
     this.headMain = new Node();
-    this.maximumSize = settings.maximumSize();
     this.data = new Long2ObjectOpenHashMap<>();
+    this.policyStats = new PolicyStats(name());
+    this.maximumSize = Math.toIntExact(settings.maximumSize());
     this.maxIn = (int) (maximumSize * settings.percentIn());
-    this.policyStats = new PolicyStats("two-queue.TwoQueue");
     this.maxOut = (int) (maximumSize * settings.percentOut());
-  }
-
-  /** Returns all variations of this policy based on the configuration parameters. */
-  public static Set<Policy> policies(Config config) {
-    return ImmutableSet.of(new TwoQueuePolicy(config));
   }
 
   @Override
@@ -95,7 +88,7 @@ public final class TwoQueuePolicy implements Policy {
     //   end if
 
     policyStats.recordOperation();
-    Node node = data.get(key);
+    @Var Node node = data.get(key);
     if (node != null) {
       switch (node.type) {
         case MAIN:
@@ -118,9 +111,8 @@ public final class TwoQueuePolicy implements Policy {
           // do nothing
           policyStats.recordHit();
           return;
-        default:
-          throw new IllegalStateException();
       }
+      throw new IllegalStateException("Unknown type: " + node.type);
     } else {
       node = new Node(key);
       node.type = QueueType.IN;
@@ -176,6 +168,7 @@ public final class TwoQueuePolicy implements Policy {
       data.remove(victim.key);
       victim.remove();
       sizeMain--;
+      data.put(node.key, node);
     }
   }
 
@@ -187,7 +180,7 @@ public final class TwoQueuePolicy implements Policy {
   enum QueueType {
     MAIN,
     IN,
-    OUT;
+    OUT,
   }
 
   static final class Node {
@@ -233,8 +226,6 @@ public final class TwoQueuePolicy implements Policy {
 
     /** Removes the node from the list. */
     public void remove() {
-      checkState(key != Long.MIN_VALUE);
-
       prev.next = next;
       next.prev = prev;
       prev = next = UNLINKED; // mark as unlinked
